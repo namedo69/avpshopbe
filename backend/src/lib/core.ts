@@ -27,12 +27,33 @@ export const safeEqual = (a: string, b: string) => {
   const x = Buffer.from(a), y = Buffer.from(b);
   return x.length === y.length && timingSafeEqual(x, y);
 };
-export function verifySepay(raw: Buffer, signature: string, timestamp: string) {
-  const seconds = Number(timestamp);
-  if (!Number.isSafeInteger(seconds) || Math.abs(Date.now() / 1000 - seconds) > 300) return false;
-  const expected = `sha256=${createHmac('sha256', env.sepaySecret).update(timestamp).update('.').update(raw).digest('hex')}`;
-  return safeEqual(signature, expected);
+
+export function verifySepay(raw: Buffer, req: Request) {
+  // 1. Kiểm tra qua API Key trong Header Authorization: Apikey <KEY>
+  const authHeader = req.header('authorization') ?? '';
+  if (authHeader) {
+    const token = authHeader.replace(/^Apikey\s+/i, '').trim();
+    if (token && safeEqual(token, env.sepaySecret)) {
+      return true;
+    }
+  }
+
+  // 2. Kiểm tra qua chữ ký HMAC-SHA256 (x-sepay-signature)
+  const signature = req.header('x-sepay-signature') ?? '';
+  const timestamp = req.header('x-sepay-timestamp') ?? '';
+  if (signature && timestamp) {
+    const seconds = Number(timestamp);
+    if (Number.isSafeInteger(seconds) && Math.abs(Date.now() / 1000 - seconds) <= 300) {
+      const expected = `sha256=${createHmac('sha256', env.sepaySecret).update(timestamp).update('.').update(raw).digest('hex')}`;
+      if (safeEqual(signature, expected)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
+
 export async function accessToken(userId: string, role: string) {
   return new SignJWT({ role }).setProtectedHeader({ alg: 'HS256' }).setSubject(userId).setIssuedAt().setExpirationTime('15m').sign(new TextEncoder().encode(env.accessSecret));
 }

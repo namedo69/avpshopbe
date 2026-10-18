@@ -58,7 +58,7 @@ async function creditDeposit(depositId: string, reference: string, eventId?: str
 }
 
 webhookRouter.post('/sepay', async (req, res) => {
-  if (!Buffer.isBuffer(req.body) || !verifySepay(req.body, req.header('x-sepay-signature') ?? '', req.header('x-sepay-timestamp') ?? '')) throw new AppError(401, 'INVALID_SIGNATURE', 'Chữ ký SePay không hợp lệ');
+  if (!Buffer.isBuffer(req.body) || !verifySepay(req.body, req)) throw new AppError(401, 'INVALID_SIGNATURE', 'Chữ ký SePay không hợp lệ');
   const raw = JSON.parse(req.body.toString('utf8')) as unknown;
   const data = parse(webhookSchema, raw);
   const eventId = String(data.id);
