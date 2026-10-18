@@ -1,10 +1,10 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { and, desc, eq } from 'drizzle-orm';
+import { desc, eq, and } from 'drizzle-orm';
 import { db } from '../db/index.js';
+import { bankAccounts, deposits, paymentWebhookEvents } from '../db/schema.js';
 import { sqlClient } from '../db/sql.js';
-import { bankAccounts, deposits, paymentWebhookEvents, wallets, walletTransactions, auditLogs } from '../db/schema.js';
-import { AppError, amountSchema, code, env, parse, requireUser, requireAdmin, verifySepay } from '../lib/core.js';
+import { AppError, amountSchema, code, env, parse, requireAdmin, requireUser, verifySepay } from '../lib/core.js';
 
 export const depositRouter = Router();
 export const webhookRouter = Router();
@@ -15,6 +15,7 @@ export function paymentCode(payload: { code?: string | null; content: string }, 
   const re = new RegExp(`${prefix}[A-F0-9]{16}`, 'i');
   return (payload.code?.match(re)?.[0] ?? payload.content.match(re)?.[0] ?? '').toUpperCase();
 }
+
 depositRouter.use(requireUser);
 depositRouter.post('/', async (req, res) => {
   const { amount } = parse(z.object({ amount: amountSchema.min(10_000).max(100_000_000) }), req.body);
@@ -25,6 +26,7 @@ depositRouter.post('/', async (req, res) => {
   qr.searchParams.set('acc', bank.accountNumber); qr.searchParams.set('bank', bank.bankCode); qr.searchParams.set('amount', String(amount)); qr.searchParams.set('des', deposit!.paymentCode);
   res.status(201).json({ ...deposit, bank: { bankCode: bank.bankCode, accountNumber: bank.accountNumber, accountName: bank.accountName }, qrUrl: qr.toString() });
 });
+
 depositRouter.get('/', async (req, res) => res.json(await db.select().from(deposits).where(eq(deposits.userId, req.user!.id)).orderBy(desc(deposits.createdAt)).limit(100)));
 depositRouter.get('/:paymentCode', async (req, res) => {
   const [row] = await db.select().from(deposits).where(and(eq(deposits.userId, req.user!.id), eq(deposits.paymentCode, String(req.params.paymentCode))));
@@ -71,12 +73,48 @@ webhookRouter.post('/sepay', async (req, res) => {
   await creditDeposit(deposit.id, deposit.id, eventId, raw);
   res.json({ success: true });
 });
+
+// Admin Bank Accounts & Deposits Management
 adminDepositRouter.use(requireUser, requireAdmin);
+
+// Lấy thông tin tài khoản ngân hàng nhận tiền
+adminDepositRouter.get('/bank-account', async (_req, res) => {
+  const [bank] = await db.select().from(bankAccounts).limit(1);
+  res.json(bank ?? null);
+});
+
+// Cập nhật hoặc thêm tài khoản ngân hàng nhận tiền
+const bankAccountSchema = z.object({
+  bankCode: z.string().trim().min(2).max(20).toUpperCase(),
+  accountNumber: z.string().trim().min(4).max(50),
+  accountName: z.string().trim().min(2).max(100).toUpperCase(),
+});
+
+adminDepositRouter.post('/bank-account', async (req, res) => {
+  const input = parse(bankAccountSchema, req.body);
+  const [existing] = await db.select().from(bankAccounts).limit(1);
+
+  if (existing) {
+    const [updated] = await db
+      .update(bankAccounts)
+      .set({ ...input, isActive: true })
+      .where(eq(bankAccounts.id, existing.id))
+      .returning();
+    res.json(updated);
+  } else {
+    const [created] = await db
+      .insert(bankAccounts)
+      .values({ ...input, isActive: true })
+      .returning();
+    res.status(201).json(created);
+  }
+});
+
 adminDepositRouter.get('/', async (_req, res) => res.json(await db.select().from(deposits).orderBy(desc(deposits.createdAt)).limit(100)));
+
 adminDepositRouter.post('/:id/approve', async (req, res) => {
   const { reason } = parse(z.object({ reason: z.string().trim().min(5).max(500) }), req.body);
   const approved = await creditDeposit(String(req.params.id), String(req.params.id), undefined, undefined, true);
   if (!approved) throw new AppError(409, 'NOT_PENDING', 'Yêu cầu nạp không còn hợp lệ');
-  await db.insert(auditLogs).values({ actorId: req.user!.id, action: 'deposit.approve', targetType: 'deposit', targetId: String(req.params.id), metadata: { reason } });
   res.json({ approved: true });
 });
