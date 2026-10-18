@@ -66,7 +66,6 @@ orderRouter.post('/', async (req, res) => {
       const result = await client.query('SELECT * FROM products WHERE id=$1 AND is_active=true', [item.productId]);
       const product = result.rows[0];
       if (!product) throw new AppError(400, 'INVALID_PRODUCT', 'Sản phẩm không khả dụng');
-      if (item.quantity < product.min_quantity || item.quantity > product.max_quantity) throw new AppError(400, 'INVALID_QUANTITY', 'Số lượng không hợp lệ');
 
       const mapping = await client.query('SELECT 1 FROM provider_products pp JOIN providers p ON p.id=pp.provider_id WHERE pp.product_id=$1 AND pp.is_active=true AND p.is_active=true LIMIT 1', [item.productId]);
       if (mapping.rows[0]) hasAnyProvider = true;

@@ -95,7 +95,7 @@ voucherRouter.post('/validate', async (req, res) => {
   let subtotal = 0, eligibleSubtotal = 0;
   for (const item of items) {
     const [product] = await db.select().from(products).where(and(eq(products.id, item.productId), eq(products.isActive, true)));
-    if (!product || item.quantity < product.minQuantity || item.quantity > product.maxQuantity) throw new AppError(400, 'INVALID_PRODUCT', 'Sản phẩm không hợp lệ');
+    if (!product) throw new AppError(400, 'INVALID_PRODUCT', 'Sản phẩm không hợp lệ hoặc đã bị tạm tắt');
     const line = (product.salePriceAmount ?? product.priceAmount) * item.quantity;
     subtotal += line;
     if (!restricted.length || restricted.some(row => row.productId === item.productId)) eligibleSubtotal += line;
