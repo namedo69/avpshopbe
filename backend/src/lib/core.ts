@@ -9,12 +9,18 @@ import { users } from '../db/schema.js';
 export class AppError extends Error {
   constructor(public status: number, public code: string, message: string, public fields: Record<string, unknown> = {}) { super(message); }
 }
+
+const rawOrigins = process.env.FRONTEND_ORIGIN || 'http://localhost:5173';
+// Hỗ trợ danh sách nhiều origin cách nhau bằng dấu phẩy
+export const allowedOrigins = rawOrigins.split(',').map(s => s.trim().replace(/\/$/, ''));
+
 export const env = {
   accessSecret: process.env.JWT_ACCESS_SECRET ?? '',
   sepaySecret: process.env.SEPAY_WEBHOOK_SECRET ?? '',
   paymentPrefix: process.env.SEPAY_PAYMENT_PREFIX ?? 'NAP',
-  frontendOrigin: process.env.FRONTEND_ORIGIN ?? 'http://localhost:5173',
+  frontendOrigin: rawOrigins,
 };
+
 export function assertConfig() {
   if (!process.env.TURSO_DATABASE_URL) throw new Error('TURSO_DATABASE_URL is required');
   if (process.env.NODE_ENV === 'production' && !process.env.TURSO_AUTH_TOKEN) throw new Error('TURSO_AUTH_TOKEN is required in production');

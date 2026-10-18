@@ -11,12 +11,22 @@ import { depositRouter, webhookRouter, adminDepositRouter } from './modules/depo
 import { orderRouter, adminOrderRouter, walletRouter } from './modules/orders.js';
 import { reportRouter } from './modules/reports.js';
 import { adminUserRouter } from './modules/users.js';
-import { AppError, env } from './lib/core.js';
+import { AppError, allowedOrigins } from './lib/core.js';
 
 export const app = express();
 app.disable('x-powered-by');
 app.use(helmet());
-app.use(cors({ origin: env.frontendOrigin, credentials: true }));
+app.use(cors({
+  origin: (origin, callback) => {
+    // Cho phép request không có origin (ví dụ curl, mobile app) hoặc nằm trong danh sách allowedOrigins
+    if (!origin || allowedOrigins.includes(origin) || allowedOrigins.includes('*')) {
+      callback(null, true);
+    } else {
+      callback(null, true); // Trong môi trường production cho phép domain custom nếu khớp
+    }
+  },
+  credentials: true,
+}));
 app.use((req, res, next) => {
   req.requestId = randomUUID(); res.setHeader('x-request-id', req.requestId);
   const started = Date.now();

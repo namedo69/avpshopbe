@@ -12,7 +12,16 @@ export const meRouter = Router();
 const credentials = z.object({ email: z.email().max(255).transform(x => x.toLowerCase()), password: z.string().min(1).max(200) });
 const registration = credentials.extend({ password: z.string().min(8).max(200), name: z.string().trim().min(1).max(120) });
 const cookieName = 'refresh_token';
-function cookieOptions() { return { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'strict' as const, path: '/api/v1/auth', maxAge: 30 * 86400 * 1000 }; }
+function cookieOptions() {
+  const isProd = process.env.NODE_ENV === 'production';
+  return {
+    httpOnly: true,
+    secure: isProd,
+    sameSite: isProd ? ('none' as const) : ('lax' as const),
+    path: '/',
+    maxAge: 30 * 86400 * 1000,
+  };
+}
 async function issueSession(user: typeof users.$inferSelect, req: import('express').Request, res: import('express').Response) {
   const refresh = randomBytes(48).toString('base64url');
   await db.insert(refreshSessions).values({ userId: user.id, tokenHash: sha256(refresh), expiresAt: new Date(Date.now() + 30 * 86400_000), ip: req.ip, userAgent: req.header('user-agent') });
