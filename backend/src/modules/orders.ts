@@ -307,6 +307,54 @@ const transitions: Record<string, string[]> = {
   cancelled: [],
 };
 
+adminOrderRouter.post('/batch-status', async (req, res) => {
+  const { ids, status, reason } = parse(
+    z.object({
+      ids: z.array(z.string().uuid()).min(1).max(200),
+      status: z.enum(['cancelled', 'failed', 'completed']),
+      reason: z.string().min(5).max(500),
+    }),
+    req.body
+  );
+
+  const client = await sqlClient.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Chuyển hàng loạt bằng 1 câu lệnh SQL duy nhất
+    const inClause = ids.map((_, i) => `$${i + 2}`).join(',');
+    const updateQuery = `
+      UPDATE orders
+      SET status = $1,
+          updated_at = (unixepoch() * 1000),
+          completed_at = CASE WHEN $1 = 'completed' THEN (unixepoch() * 1000) ELSE completed_at END
+      WHERE id IN (${inClause})
+      RETURNING id, order_code, status
+    `;
+
+    const result = await client.query(updateQuery, [status, ...ids]);
+    const updatedRows = result.rows;
+
+    // Ghi audit logs 1 lần cho batch
+    await client.query(
+      "INSERT INTO audit_logs(actor_id, action, target_type, target_id, metadata) VALUES($1, 'order.batch_status', 'orders', $2, $3)",
+      [req.user!.id, 'batch', JSON.stringify({ count: updatedRows.length, status, reason })]
+    );
+
+    await client.query('COMMIT');
+    res.json({
+      success: true,
+      updatedCount: updatedRows.length,
+      orders: updatedRows,
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+});
+
 adminOrderRouter.patch('/:id/status', async (req, res) => {
   const { status, reason } = parse(z.object({ status: z.enum(['cancelled', 'failed', 'completed']), reason: z.string().min(5).max(500) }), req.body);
   const client = await sqlClient.connect();
