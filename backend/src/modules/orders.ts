@@ -133,7 +133,15 @@ adminOrderRouter.get('/:id', async (req, res) => {
   if (!row) throw new AppError(404, 'NOT_FOUND', 'Không tìm thấy đơn hàng');
   res.json({ ...row, items: await db.select().from(orderItems).where(eq(orderItems.orderId, row.id)), statusLogs: await db.select().from(orderStatusLogs).where(eq(orderStatusLogs.orderId, row.id)).orderBy(orderStatusLogs.createdAt), providerOrders: await db.select().from(providerOrders).where(eq(providerOrders.orderId, row.id)) });
 });
-const transitions: Record<string, string[]> = { queued: ['cancelled', 'failed'], sending: ['processing', 'failed'], processing: ['completed', 'failed'], failed: ['refunded'] };
+const transitions: Record<string, string[]> = {
+  queued: ['processing', 'completed', 'cancelled', 'failed'],
+  sending: ['processing', 'completed', 'failed'],
+  processing: ['completed', 'failed'],
+  failed: ['refunded', 'completed'],
+  completed: [],
+  refunded: [],
+  cancelled: [],
+};
 adminOrderRouter.patch('/:id/status', async (req, res) => {
   const { status, reason } = parse(z.object({ status: z.enum(['cancelled', 'failed', 'completed']), reason: z.string().min(5).max(500) }), req.body);
   const client = await sqlClient.connect();
