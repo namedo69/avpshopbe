@@ -89,7 +89,45 @@ orderRouter.get('/:orderCode', async (req, res) => {
   res.json({ ...order, items: await db.select().from(orderItems).where(eq(orderItems.orderId, order.id)) });
 });
 adminOrderRouter.use(requireUser, requireAdmin);
-adminOrderRouter.get('/', async (_req, res) => res.json(await db.select().from(orders).orderBy(desc(orders.createdAt)).limit(100)));
+adminOrderRouter.get('/', async (_req, res) => {
+  const result = await sqlClient.query(`
+    SELECT o.*,
+      COALESCE(
+        json_group_array(
+          json_object(
+            'id', oi.id,
+            'productId', oi.product_id,
+            'productName', oi.product_name,
+            'unitPrice', oi.unit_price,
+            'quantity', oi.quantity,
+            'totalAmount', oi.total_amount,
+            'customerInput', json(oi.customer_input)
+          )
+        ), '[]'
+      ) AS items
+    FROM orders o
+    LEFT JOIN order_items oi ON oi.order_id = o.id
+    GROUP BY o.id
+    ORDER BY o.created_at DESC
+    LIMIT 100
+  `);
+
+  const list = result.rows.map(row => {
+    let items = [];
+    try {
+      items = typeof row.items === 'string' ? JSON.parse(row.items) : row.items;
+      // Lọc bỏ item null nếu không có items
+      if (Array.isArray(items) && items.length === 1 && !items[0].id) {
+        items = [];
+      }
+    } catch {
+      items = [];
+    }
+    return { ...row, items };
+  });
+
+  res.json(list);
+});
 adminOrderRouter.get('/:id', async (req, res) => {
   const [row] = await db.select().from(orders).where(eq(orders.id, String(req.params.id)));
   if (!row) throw new AppError(404, 'NOT_FOUND', 'Không tìm thấy đơn hàng');
