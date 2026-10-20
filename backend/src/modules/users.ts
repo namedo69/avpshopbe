@@ -3,29 +3,59 @@ import { z } from 'zod';
 import { desc, eq, sql } from 'drizzle-orm';
 import { randomUUID } from 'node:crypto';
 import { db } from '../db/index.js';
-import { users, wallets, walletTransactions, auditLogs } from '../db/schema.js';
+import { users, wallets, walletTransactions, auditLogs, userTiers } from '../db/schema.js';
+import { sqlClient } from '../db/sql.js';
 import { AppError, parse, requireAdmin, requireUser, amountSchema } from '../lib/core.js';
 
 export const adminUserRouter = Router();
 
 adminUserRouter.use(requireUser, requireAdmin);
 
-// Lấy danh sách người dùng kèm số dư ví
+// Lấy danh sách người dùng kèm số dư ví, loại tài khoản và thống kê số đơn
 adminUserRouter.get('/', async (_req, res) => {
-  const list = await db
-    .select({
-      id: users.id,
-      email: users.email,
-      name: users.name,
-      role: users.role,
-      status: users.status,
-      createdAt: users.createdAt,
-      balance: wallets.balanceAmount,
-    })
-    .from(users)
-    .leftJoin(wallets, eq(users.id, wallets.userId))
-    .orderBy(desc(users.createdAt))
-    .limit(200);
+  const result = await sqlClient.query(`
+    SELECT 
+      u.id,
+      u.email,
+      u.name,
+      u.role,
+      u.tier_id AS "tierId",
+      u.status,
+      u.created_at AS "createdAt",
+      COALESCE(w.balance_amount, 0) AS balance,
+      COALESCE(ut.name, CASE WHEN u.role = 'admin' THEN 'Quản trị viên' ELSE 'Thành viên' END) AS "tierName",
+      COALESCE(ut.code, CASE WHEN u.role = 'admin' THEN 'admin' ELSE 'thanh_vien' END) AS "tierCode",
+      COALESCE(ut.discount_percent, CASE WHEN u.role = 'admin' THEN 100 ELSE 0 END) AS "tierDiscount",
+      COUNT(DISTINCT o.id) AS "totalOrders",
+      COUNT(DISTINCT CASE WHEN o.status = 'completed' THEN o.id END) AS "completedOrders",
+      COUNT(DISTINCT CASE WHEN o.status IN ('queued', 'sending', 'processing') THEN o.id END) AS "processingOrders",
+      COALESCE(SUM(CASE WHEN o.status = 'completed' THEN o.total_amount ELSE 0 END), 0) AS "totalSpent"
+    FROM users u
+    LEFT JOIN wallets w ON w.user_id = u.id
+    LEFT JOIN user_tiers ut ON ut.id = u.tier_id
+    LEFT JOIN orders o ON o.user_id = u.id
+    GROUP BY u.id
+    ORDER BY u.created_at DESC
+    LIMIT 200
+  `);
+
+  const list = result.rows.map(row => ({
+    id: row.id,
+    email: row.email,
+    name: row.name,
+    role: row.role,
+    tierId: row.tierId,
+    tierName: row.tierName,
+    tierCode: row.tierCode,
+    tierDiscount: Number(row.tierDiscount) || 0,
+    status: row.status,
+    createdAt: row.createdAt,
+    balance: Number(row.balance) || 0,
+    totalOrders: Number(row.totalOrders) || 0,
+    completedOrders: Number(row.completedOrders) || 0,
+    processingOrders: Number(row.processingOrders) || 0,
+    totalSpent: Number(row.totalSpent) || 0,
+  }));
 
   res.json(list);
 });
@@ -105,10 +135,11 @@ adminUserRouter.post('/:id/balance', async (req, res) => {
   res.json(result);
 });
 
-// Cập nhật trạng thái (active / blocked) hoặc phân quyền (customer / admin)
+// Cập nhật trạng thái (active / blocked), phân quyền (customer / admin), hoặc loại người dùng (tierId)
 const updateUserSchema = z.object({
   status: z.enum(['active', 'blocked']).optional(),
   role: z.enum(['customer', 'admin']).optional(),
+  tierId: z.string().optional(),
   name: z.string().trim().min(1).max(120).optional(),
 });
 
@@ -119,6 +150,13 @@ adminUserRouter.patch('/:id', async (req, res) => {
   // Không cho admin tự block chính mình
   if (req.user?.id === userId && input.status === 'blocked') {
     throw new AppError(400, 'BAD_REQUEST', 'Không thể tự khóa tài khoản của chính mình');
+  }
+
+  // Tự động đồng bộ tier nếu thăng admin
+  if (input.role === 'admin' && !input.tierId) {
+    input.tierId = 'tier_admin';
+  } else if (input.role === 'customer' && !input.tierId) {
+    input.tierId = 'tier_member';
   }
 
   const [updatedUser] = await db

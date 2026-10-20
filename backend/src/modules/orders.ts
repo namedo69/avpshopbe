@@ -54,9 +54,18 @@ orderRouter.post('/', async (req, res) => {
       return;
     }
 
-    // 2. Kiểm tra tài khoản user
-    const user = await client.query("SELECT status FROM users WHERE id=$1", [req.user!.id]);
-    if (user.rows[0]?.status !== 'active') throw new AppError(403, 'ACCOUNT_BLOCKED', 'Tài khoản không hoạt động');
+    // 2. Kiểm tra tài khoản user và thông tin loại người dùng (tier)
+    const userRes = await client.query(`
+      SELECT u.status, u.role, u.tier_id,
+        COALESCE(ut.discount_percent, CASE WHEN u.role = 'admin' THEN 100 ELSE 0 END) AS tier_discount
+      FROM users u
+      LEFT JOIN user_tiers ut ON ut.id = u.tier_id
+      WHERE u.id = $1
+    `, [req.user!.id]);
+    const user = userRes.rows[0];
+    if (user?.status !== 'active') throw new AppError(403, 'ACCOUNT_BLOCKED', 'Tài khoản không hoạt động');
+
+    const tierDiscountPercent = user.role === 'admin' ? 100 : (Number(user.tier_discount) || 0);
 
     let subtotal = 0;
     const lines: { productId: string; name: string; quantity: number; unitPrice: number; total: number; customerInput: Record<string, unknown> }[] = [];
@@ -77,8 +86,25 @@ orderRouter.post('/', async (req, res) => {
         }
       }
 
-      const price = Number(product.sale_price_amount ?? product.price_amount);
-      const total = price * item.quantity;
+      // Tính đơn giá theo loại người dùng (Admin giảm 100%, CTV giảm theo %, hoặc giá cấu hình riêng)
+      const basePrice = Number(product.sale_price_amount ?? product.price_amount);
+      let effectiveUnitPrice = basePrice;
+
+      if (user.role === 'admin' || tierDiscountPercent >= 100) {
+        effectiveUnitPrice = 0; // Admin mặc định miễn phí 100%
+      } else {
+        const customTier = await client.query(
+          'SELECT custom_price_amount FROM tier_product_prices WHERE tier_id=$1 AND product_id=$2',
+          [user.tier_id, item.productId]
+        );
+        if (customTier.rows[0]?.custom_price_amount !== null && customTier.rows[0]?.custom_price_amount !== undefined) {
+          effectiveUnitPrice = Number(customTier.rows[0].custom_price_amount);
+        } else if (tierDiscountPercent > 0) {
+          effectiveUnitPrice = Math.max(0, Math.round(basePrice * (100 - tierDiscountPercent) / 100));
+        }
+      }
+
+      const total = effectiveUnitPrice * item.quantity;
       if (!Number.isSafeInteger(total)) throw new AppError(400, 'AMOUNT_OVERFLOW', 'Tổng tiền quá lớn');
 
       subtotal += total;
@@ -86,7 +112,7 @@ orderRouter.post('/', async (req, res) => {
         productId: item.productId,
         name: product.name,
         quantity: item.quantity,
-        unitPrice: price,
+        unitPrice: effectiveUnitPrice,
         total,
         customerInput: item.customerInput,
       });
@@ -128,15 +154,26 @@ orderRouter.post('/', async (req, res) => {
       await client.query('UPDATE vouchers SET used_count=used_count+1 WHERE id=$1', [v.id]);
     }
 
-    const finalTotalPayment = subtotal - totalDiscount;
+    const finalTotalPayment = Math.max(0, subtotal - totalDiscount);
 
-    // 4. Trừ tiền ví 1 LẦN DUY NHẤT cho toàn bộ gói
-    const wallet = await client.query(
-      'UPDATE wallets SET balance_amount=balance_amount-$2, version=version+1 WHERE user_id=$1 AND balance_amount>=$2 RETURNING balance_amount+$2 AS before,balance_amount AS after',
-      [req.user!.id, finalTotalPayment]
-    );
+    // 4. Trừ tiền ví (Nếu số tiền > 0)
+    let walletBefore = 0;
+    let walletAfter = 0;
 
-    if (!wallet.rows[0]) throw new AppError(409, 'INSUFFICIENT_BALANCE', 'Số dư không đủ để thanh toán');
+    if (finalTotalPayment > 0) {
+      const wallet = await client.query(
+        'UPDATE wallets SET balance_amount=balance_amount-$2, version=version+1 WHERE user_id=$1 AND balance_amount>=$2 RETURNING balance_amount+$2 AS before,balance_amount AS after',
+        [req.user!.id, finalTotalPayment]
+      );
+
+      if (!wallet.rows[0]) throw new AppError(409, 'INSUFFICIENT_BALANCE', 'Số dư không đủ để thanh toán');
+      walletBefore = Number(wallet.rows[0].before);
+      walletAfter = Number(wallet.rows[0].after);
+    } else {
+      const currentWallet = await client.query('SELECT balance_amount FROM wallets WHERE user_id=$1', [req.user!.id]);
+      walletBefore = Number(currentWallet.rows[0]?.balance_amount ?? 0);
+      walletAfter = walletBefore;
+    }
 
     // 5. Nếu khách chọn tách đơn lẻ (splitOrders = true)
     if (input.splitOrders && lines.length > 1) {
@@ -182,7 +219,7 @@ orderRouter.post('/', async (req, res) => {
       // Ghi 1 giao dịch ví cho toàn bộ lần thanh toán
       await client.query(
         "INSERT INTO wallet_transactions(user_id,type,amount,balance_before,balance_after,reference_type,reference_id,status,description) VALUES($1,'purchase',$2,$3,$4,'order',$5,'completed',$6)",
-        [req.user!.id, -finalTotalPayment, wallet.rows[0].before, wallet.rows[0].after, key, `Thanh toán ${lines.length} đơn hàng (${input.voucherCode ? `Áp mã ${input.voucherCode}` : 'Không áp mã'})`]
+        [req.user!.id, -finalTotalPayment, walletBefore, walletAfter, key, `Thanh toán ${lines.length} đơn hàng (${input.voucherCode ? `Áp mã ${input.voucherCode}` : 'Không áp mã'})`]
       );
 
       await client.query('COMMIT');
@@ -216,7 +253,7 @@ orderRouter.post('/', async (req, res) => {
 
     await client.query(
       "INSERT INTO wallet_transactions(user_id,type,amount,balance_before,balance_after,reference_type,reference_id,status) VALUES($1,'purchase',$2,$3,$4,'order',$5,'completed')",
-      [req.user!.id, -finalTotalPayment, wallet.rows[0].before, wallet.rows[0].after, order.id]
+      [req.user!.id, -finalTotalPayment, walletBefore, walletAfter, order.id]
     );
 
     await client.query("INSERT INTO order_status_logs(order_id,to_status,actor_type,actor_id) VALUES($1,'queued','customer',$2)", [order.id, req.user!.id]);
@@ -235,9 +272,45 @@ orderRouter.post('/', async (req, res) => {
   }
 });
 
-orderRouter.get('/', async (req, res) =>
-  res.json(await db.select().from(orders).where(eq(orders.userId, req.user!.id)).orderBy(desc(orders.createdAt)).limit(100))
-);
+orderRouter.get('/', async (req, res) => {
+  const result = await sqlClient.query(`
+    SELECT o.*,
+      COALESCE(
+        json_group_array(
+          json_object(
+            'id', oi.id,
+            'productId', oi.product_id,
+            'productName', oi.product_name,
+            'unitPrice', oi.unit_price,
+            'quantity', oi.quantity,
+            'totalAmount', oi.total_amount,
+            'customerInput', json(oi.customer_input)
+          )
+        ), '[]'
+      ) AS items
+    FROM orders o
+    LEFT JOIN order_items oi ON oi.order_id = o.id
+    WHERE o.user_id = $1
+    GROUP BY o.id
+    ORDER BY o.created_at DESC
+    LIMIT 100
+  `, [req.user!.id]);
+
+  const list = result.rows.map(row => {
+    let items = [];
+    try {
+      items = typeof row.items === 'string' ? JSON.parse(row.items) : row.items;
+      if (Array.isArray(items) && items.length === 1 && !items[0].id) {
+        items = [];
+      }
+    } catch {
+      items = [];
+    }
+    return { ...row, items };
+  });
+
+  res.json(list);
+});
 
 orderRouter.get('/:orderCode', async (req, res) => {
   const [order] = await db.select().from(orders).where(and(eq(orders.userId, req.user!.id), eq(orders.orderCode, String(req.params.orderCode))));

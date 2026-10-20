@@ -8,9 +8,22 @@ const updated = () => integer('updated_at', { mode: 'timestamp_ms' }).notNull().
 const money = (name: string) => integer(name).notNull();
 const json = (name: string) => text(name, { mode: 'json' }).notNull().default(sql`'{}'`);
 
+export const userTiers = sqliteTable('user_tiers', {
+  id: id(),
+  code: text('code').notNull().unique(),
+  name: text('name').notNull(),
+  discountPercent: integer('discount_percent').notNull().default(0),
+  description: text('description'),
+  isDefault: integer('is_default', { mode: 'boolean' }).notNull().default(false),
+  isActive: integer('is_active', { mode: 'boolean' }).notNull().default(true),
+  sortOrder: integer('sort_order').notNull().default(0),
+  createdAt: created(),
+  updatedAt: updated(),
+});
+
 export const users = sqliteTable('users', {
   id: id(), email: text('email').notNull().unique(), passwordHash: text('password_hash').notNull(), name: text('name').notNull(),
-  role: text('role').notNull().default('customer'), status: text('status').notNull().default('active'), createdAt: created(), updatedAt: updated(),
+  role: text('role').notNull().default('customer'), tierId: text('tier_id').references(() => userTiers.id), status: text('status').notNull().default('active'), createdAt: created(), updatedAt: updated(),
 });
 export const refreshSessions = sqliteTable('refresh_sessions', {
   id: id(), userId: text('user_id').notNull().references(() => users.id), tokenHash: text('token_hash').notNull().unique(),
@@ -98,6 +111,15 @@ export const outboxJobs = sqliteTable('outbox_jobs', {
   attempts: integer('attempts').notNull().default(0), availableAt: integer('available_at', { mode: 'timestamp_ms' }).notNull().default(sql`(unixepoch()*1000)`),
   lockedAt: integer('locked_at', { mode: 'timestamp_ms' }), lockedBy: text('locked_by'), lastError: text('last_error'), createdAt: created(),
 });
+export const tierProductPrices = sqliteTable('tier_product_prices', {
+  id: id(),
+  tierId: text('tier_id').notNull().references(() => userTiers.id),
+  productId: text('product_id').notNull().references(() => products.id),
+  customPriceAmount: money('custom_price_amount'),
+  createdAt: created(),
+  updatedAt: updated(),
+}, t => [uniqueIndex('tier_product_unique').on(t.tierId, t.productId)]);
+
 export const auditLogs = sqliteTable('audit_logs', {
   id: id(), actorId: text('actor_id').references(() => users.id), action: text('action').notNull(), targetType: text('target_type').notNull(),
   targetId: text('target_id').notNull(), metadata: json('metadata'), createdAt: created(),

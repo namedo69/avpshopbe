@@ -4,7 +4,7 @@ import argon2 from 'argon2';
 import { randomBytes } from 'node:crypto';
 import { eq, and, gt, isNull } from 'drizzle-orm';
 import { db } from '../db/index.js';
-import { users, wallets, refreshSessions } from '../db/schema.js';
+import { users, wallets, refreshSessions, userTiers } from '../db/schema.js';
 import { AppError, accessToken, parse, requireUser, sha256 } from '../lib/core.js';
 
 export const authRouter = Router();
@@ -26,13 +26,26 @@ async function issueSession(user: typeof users.$inferSelect, req: import('expres
   const refresh = randomBytes(48).toString('base64url');
   await db.insert(refreshSessions).values({ userId: user.id, tokenHash: sha256(refresh), expiresAt: new Date(Date.now() + 30 * 86400_000), ip: req.ip, userAgent: req.header('user-agent') });
   res.cookie(cookieName, refresh, cookieOptions());
-  return { accessToken: await accessToken(user.id, user.role), user: { id: user.id, email: user.email, name: user.name, role: user.role } };
+
+  // Lấy thông tin tier
+  const tierResult = await db.query?.userTiers?.findFirst?.({ where: eq(userTiers.id, user.tierId ?? '') }) ?? null;
+
+  return {
+    accessToken: await accessToken(user.id, user.role),
+    user: {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      role: user.role,
+      tierId: user.tierId ?? (user.role === 'admin' ? 'tier_admin' : 'tier_member'),
+    },
+  };
 }
 authRouter.post('/register', async (req, res) => {
   const data = parse(registration, req.body);
   const hash = await argon2.hash(data.password, { type: argon2.argon2id });
   const result = await db.transaction(async tx => {
-    const [user] = await tx.insert(users).values({ email: data.email, passwordHash: hash, name: data.name }).onConflictDoNothing().returning();
+    const [user] = await tx.insert(users).values({ email: data.email, passwordHash: hash, name: data.name, tierId: 'tier_member' }).onConflictDoNothing().returning();
     if (!user) throw new AppError(409, 'EMAIL_EXISTS', 'Email đã được sử dụng');
     await tx.insert(wallets).values({ userId: user.id, balanceAmount: 0 });
     return user;
@@ -62,7 +75,32 @@ authRouter.post('/logout', async (req, res) => {
   res.clearCookie(cookieName, cookieOptions()); res.status(204).end();
 });
 meRouter.get('/me', requireUser, async (req, res) => {
-  const [user] = await db.select({ id: users.id, email: users.email, name: users.name, role: users.role, status: users.status }).from(users).where(eq(users.id, req.user!.id));
+  const [user] = await db.select({
+    id: users.id,
+    email: users.email,
+    name: users.name,
+    role: users.role,
+    status: users.status,
+    tierId: users.tierId,
+    tierName: userTiers.name,
+    tierCode: userTiers.code,
+    tierDiscount: userTiers.discountPercent,
+  })
+  .from(users)
+  .leftJoin(userTiers, eq(users.tierId, userTiers.id))
+  .where(eq(users.id, req.user!.id));
+
   if (!user || user.status !== 'active') throw new AppError(401, 'UNAUTHORIZED', 'Tài khoản không hoạt động');
-  res.json(user);
+  
+  // Mặc định nếu là admin thì giảm 100%
+  const effectiveDiscount = user.role === 'admin' ? 100 : (user.tierDiscount ?? 0);
+  const effectiveTierName = user.role === 'admin' ? 'Quản trị viên' : (user.tierName ?? 'Thành viên');
+  const effectiveTierCode = user.role === 'admin' ? 'admin' : (user.tierCode ?? 'thanh_vien');
+
+  res.json({
+    ...user,
+    tierDiscount: effectiveDiscount,
+    tierName: effectiveTierName,
+    tierCode: effectiveTierCode,
+  });
 });

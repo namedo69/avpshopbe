@@ -9,13 +9,15 @@ export const productRouter = Router();
 export const adminProductRouter = Router();
 export const voucherRouter = Router();
 export const adminVoucherRouter = Router();
-const productInput = z.object({
+const productBaseSchema = z.object({
   name: z.string().trim().min(1).max(200), slug: z.string().regex(/^[a-z0-9-]+$/).max(200), description: z.string().max(5000).nullable().optional(),
   categoryId: z.uuid().nullable().optional(), imageUrl: z.url().nullable().optional(), priceAmount: amountSchema,
   salePriceAmount: amountSchema.nullable().optional(), inputSchema: z.record(z.string(), z.unknown()).default({}),
   minQuantity: z.number().int().min(1).max(10000).default(1), maxQuantity: z.number().int().min(1).max(10000).default(1),
   isActive: z.boolean().default(true), sortOrder: z.number().int().default(0),
-}).refine(x => x.maxQuantity >= x.minQuantity && (!x.salePriceAmount || x.salePriceAmount <= x.priceAmount));
+});
+const productInput = productBaseSchema.refine(x => x.maxQuantity >= x.minQuantity && (!x.salePriceAmount || x.salePriceAmount <= x.priceAmount));
+const productUpdateSchema = productBaseSchema.partial();
 productRouter.get('/', async (_req, res) => res.json(await db.select().from(products).where(eq(products.isActive, true)).orderBy(products.sortOrder).limit(200)));
 productRouter.get('/:slug', async (req, res) => {
   const [row] = await db.select().from(products).where(and(eq(products.slug, String(req.params.slug)), eq(products.isActive, true)));
@@ -30,7 +32,7 @@ adminProductRouter.post('/', async (req, res) => {
   res.status(201).json(row);
 });
 adminProductRouter.patch('/:id', async (req, res) => {
-  const input = parse(productInput.safeExtend({}).partial(), req.body);
+  const input = parse(productUpdateSchema, req.body);
   const [row] = await db.update(products).set({ ...input, updatedAt: new Date() }).where(eq(products.id, String(req.params.id))).returning();
   if (!row) throw new AppError(404, 'NOT_FOUND', 'Không tìm thấy sản phẩm');
   await db.insert(auditLogs).values({ actorId: req.user!.id, action: 'product.update', targetType: 'product', targetId: row.id, metadata: input });
@@ -48,16 +50,33 @@ adminProductRouter.post('/:id/provider', async (req, res) => {
   await db.insert(auditLogs).values({ actorId: req.user!.id, action: 'product.provider.add', targetType: 'product', targetId: String(req.params.id) });
   res.status(201).json(row);
 });
-const voucherInput = z.object({
+const voucherBaseInput = z.object({
   code: z.string().trim().min(3).max(40).regex(/^[A-Za-z0-9_-]+$/).transform(x => x.toUpperCase()), type: z.enum(['percent', 'fixed']),
   valueAmount: amountSchema.nullable().optional(), valuePercent: z.number().int().min(1).max(100).nullable().optional(),
   maxDiscountAmount: amountSchema.nullable().optional(), minOrderAmount: z.number().int().safe().min(0).default(0),
   totalUsageLimit: z.number().int().positive().nullable().optional(), perUserLimit: z.number().int().positive().nullable().optional(),
   startsAt: z.coerce.date().nullable().optional(), endsAt: z.coerce.date().nullable().optional(), isActive: z.boolean().default(true),
-  productIds: z.array(z.uuid()).default([]),
-}).refine(x => x.type === 'fixed' ? !!x.valueAmount : !!x.valuePercent);
+  productIds: z.array(z.string()).default([]),
+});
+const voucherInput = voucherBaseInput.refine(x => x.type === 'fixed' ? !!x.valueAmount : !!x.valuePercent);
+
+const voucherUpdateInput = z.object({
+  code: z.string().trim().min(3).max(40).regex(/^[A-Za-z0-9_-]+$/).transform(x => x.toUpperCase()).optional(),
+  type: z.enum(['percent', 'fixed']).optional(),
+  valueAmount: amountSchema.nullable().optional(),
+  valuePercent: z.number().int().min(1).max(100).nullable().optional(),
+  maxDiscountAmount: amountSchema.nullable().optional(),
+  minOrderAmount: z.number().int().safe().min(0).optional(),
+  totalUsageLimit: z.number().int().positive().nullable().optional(),
+  perUserLimit: z.number().int().positive().nullable().optional(),
+  startsAt: z.coerce.date().nullable().optional(),
+  endsAt: z.coerce.date().nullable().optional(),
+  isActive: z.boolean().optional(),
+  productIds: z.array(z.string()).optional(),
+});
+
 adminVoucherRouter.use(requireUser, requireAdmin);
-adminVoucherRouter.get('/', async (_req, res) => res.json(await db.select().from(vouchers).limit(200)));
+adminVoucherRouter.get('/', async (_req, res) => res.json(await db.select().from(vouchers).orderBy(desc(vouchers.isActive)).limit(200)));
 adminVoucherRouter.post('/', async (req, res) => {
   const { productIds, ...input } = parse(voucherInput, req.body);
   const row = await db.transaction(async tx => {
@@ -69,14 +88,21 @@ adminVoucherRouter.post('/', async (req, res) => {
   res.status(201).json(row);
 });
 adminVoucherRouter.patch('/:id', async (req, res) => {
-  const input = parse(voucherInput.safeExtend({}).partial(), req.body);
+  const input = parse(voucherUpdateInput, req.body);
   const { productIds, ...values } = input;
   const row = await db.transaction(async tx => {
     const [v] = await tx.update(vouchers).set(values).where(eq(vouchers.id, String(req.params.id))).returning();
     if (!v) throw new AppError(404, 'NOT_FOUND', 'Không tìm thấy voucher');
-    if (productIds) { await tx.delete(voucherProducts).where(eq(voucherProducts.voucherId, v.id)); if (productIds.length) await tx.insert(voucherProducts).values(productIds.map((productId: string) => ({ voucherId: v.id, productId }))); }
-    await tx.insert(auditLogs).values({ actorId: req.user!.id, action: 'voucher.update', targetType: 'voucher', targetId: v.id }); return v;
-  }); res.json(row);
+    if (productIds) {
+      await tx.delete(voucherProducts).where(eq(voucherProducts.voucherId, v.id));
+      if (productIds.length) {
+        await tx.insert(voucherProducts).values(productIds.map((productId: string) => ({ voucherId: v.id, productId })));
+      }
+    }
+    await tx.insert(auditLogs).values({ actorId: req.user!.id, action: 'voucher.update', targetType: 'voucher', targetId: v.id });
+    return v;
+  });
+  res.json(row);
 });
 adminVoucherRouter.delete('/:id', async (req, res) => {
   const [row] = await db.update(vouchers).set({ isActive: false }).where(eq(vouchers.id, String(req.params.id))).returning();
