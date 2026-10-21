@@ -29,7 +29,13 @@ adminUserRouter.get('/', async (_req, res) => {
       COUNT(DISTINCT o.id) AS "totalOrders",
       COUNT(DISTINCT CASE WHEN o.status = 'completed' THEN o.id END) AS "completedOrders",
       COUNT(DISTINCT CASE WHEN o.status IN ('queued', 'sending', 'processing') THEN o.id END) AS "processingOrders",
-      COALESCE(SUM(CASE WHEN o.status = 'completed' THEN o.total_amount ELSE 0 END), 0) AS "totalSpent"
+      COALESCE(SUM(CASE WHEN o.status = 'completed' THEN o.total_amount ELSE 0 END), 0) AS "totalSpent",
+      COALESCE((
+        SELECT SUM(oi.quantity)
+        FROM orders o2
+        JOIN order_items oi ON oi.order_id = o2.id
+        WHERE o2.user_id = u.id
+      ), 0) AS "totalCodes"
     FROM users u
     LEFT JOIN wallets w ON w.user_id = u.id
     LEFT JOIN user_tiers ut ON ut.id = u.tier_id
@@ -52,10 +58,53 @@ adminUserRouter.get('/', async (_req, res) => {
     createdAt: row.createdAt,
     balance: Number(row.balance) || 0,
     totalOrders: Number(row.totalOrders) || 0,
+    totalCodes: Number(row.totalCodes) || 0,
     completedOrders: Number(row.completedOrders) || 0,
     processingOrders: Number(row.processingOrders) || 0,
     totalSpent: Number(row.totalSpent) || 0,
   }));
+
+  res.json(list);
+});
+
+// Lấy danh sách toàn bộ đơn hàng và code sự kiện của 1 tài khoản cụ thể
+adminUserRouter.get('/:id/orders', async (req, res) => {
+  const userId = String(req.params.id);
+  const result = await sqlClient.query(`
+    SELECT o.*,
+      COALESCE(
+        json_group_array(
+          json_object(
+            'id', oi.id,
+            'productId', oi.product_id,
+            'productName', oi.product_name,
+            'unitPrice', oi.unit_price,
+            'quantity', oi.quantity,
+            'totalAmount', oi.total_amount,
+            'customerInput', json(oi.customer_input)
+          )
+        ), '[]'
+      ) AS items
+    FROM orders o
+    LEFT JOIN order_items oi ON oi.order_id = o.id
+    WHERE o.user_id = $1
+    GROUP BY o.id
+    ORDER BY o.created_at DESC
+    LIMIT 200
+  `, [userId]);
+
+  const list = result.rows.map(row => {
+    let items = [];
+    try {
+      items = typeof row.items === 'string' ? JSON.parse(row.items) : row.items;
+      if (Array.isArray(items) && items.length === 1 && !items[0].id) {
+        items = [];
+      }
+    } catch {
+      items = [];
+    }
+    return { ...row, items };
+  });
 
   res.json(list);
 });

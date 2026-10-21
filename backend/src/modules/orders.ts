@@ -320,7 +320,11 @@ orderRouter.get('/:orderCode', async (req, res) => {
 
 adminOrderRouter.use(requireUser, requireAdmin);
 
-adminOrderRouter.get('/', async (_req, res) => {
+adminOrderRouter.get('/', async (req, res) => {
+  const userId = req.query.userId ? String(req.query.userId) : null;
+  const whereClause = userId ? 'WHERE o.user_id = $1' : '';
+  const params = userId ? [userId] : [];
+
   const result = await sqlClient.query(`
     SELECT o.*,
       COALESCE(
@@ -338,10 +342,11 @@ adminOrderRouter.get('/', async (_req, res) => {
       ) AS items
     FROM orders o
     LEFT JOIN order_items oi ON oi.order_id = o.id
+    ${whereClause}
     GROUP BY o.id
     ORDER BY o.created_at DESC
-    LIMIT 100
-  `);
+    LIMIT 200
+  `, params);
 
   const list = result.rows.map(row => {
     let items = [];
