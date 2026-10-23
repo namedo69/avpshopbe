@@ -324,9 +324,11 @@ adminOrderRouter.get('/', async (req, res) => {
   const userId = req.query.userId ? String(req.query.userId) : null;
   const whereClause = userId ? 'WHERE o.user_id = $1' : '';
   const params = userId ? [userId] : [];
+  const limit = Math.min(Number(req.query.limit) || 10000, 50000);
 
   const result = await sqlClient.query(`
     SELECT o.*,
+      json_object('id', u.id, 'email', u.email, 'name', u.name) AS "user",
       COALESCE(
         json_group_array(
           json_object(
@@ -341,11 +343,12 @@ adminOrderRouter.get('/', async (req, res) => {
         ), '[]'
       ) AS items
     FROM orders o
+    LEFT JOIN users u ON u.id = o.user_id
     LEFT JOIN order_items oi ON oi.order_id = o.id
     ${whereClause}
     GROUP BY o.id
     ORDER BY o.created_at DESC
-    LIMIT 200
+    LIMIT ${limit}
   `, params);
 
   const list = result.rows.map(row => {
@@ -358,7 +361,13 @@ adminOrderRouter.get('/', async (req, res) => {
     } catch {
       items = [];
     }
-    return { ...row, items };
+    let user = null;
+    try {
+      user = typeof row.user === 'string' ? JSON.parse(row.user) : row.user;
+    } catch {
+      user = null;
+    }
+    return { ...row, items, user };
   });
 
   res.json(list);
@@ -388,7 +397,7 @@ const transitions: Record<string, string[]> = {
 adminOrderRouter.post('/batch-status', async (req, res) => {
   const { ids, status, reason } = parse(
     z.object({
-      ids: z.array(z.string().uuid()).min(1).max(200),
+      ids: z.array(z.string().uuid()).min(1).max(5000),
       status: z.enum(['cancelled', 'failed', 'completed']),
       reason: z.string().min(5).max(500),
     }),

@@ -18,13 +18,13 @@ const productBaseSchema = z.object({
 });
 const productInput = productBaseSchema.refine(x => x.maxQuantity >= x.minQuantity && (!x.salePriceAmount || x.salePriceAmount <= x.priceAmount));
 const productUpdateSchema = productBaseSchema.partial();
-productRouter.get('/', async (_req, res) => res.json(await db.select().from(products).where(eq(products.isActive, true)).orderBy(products.sortOrder).limit(200)));
+productRouter.get('/', async (_req, res) => res.json(await db.select().from(products).where(eq(products.isActive, true)).orderBy(products.sortOrder).limit(1000)));
 productRouter.get('/:slug', async (req, res) => {
   const [row] = await db.select().from(products).where(and(eq(products.slug, String(req.params.slug)), eq(products.isActive, true)));
   if (!row) throw new AppError(404, 'NOT_FOUND', 'Không tìm thấy sản phẩm'); res.json(row);
 });
 adminProductRouter.use(requireUser, requireAdmin);
-adminProductRouter.get('/', async (_req, res) => res.json(await db.select().from(products).orderBy(desc(products.createdAt)).limit(200)));
+adminProductRouter.get('/', async (_req, res) => res.json(await db.select().from(products).orderBy(desc(products.createdAt)).limit(1000)));
 adminProductRouter.post('/', async (req, res) => {
   const input = parse(productInput, req.body);
   const [row] = await db.insert(products).values(input).returning();
@@ -76,7 +76,7 @@ const voucherUpdateInput = z.object({
 });
 
 adminVoucherRouter.use(requireUser, requireAdmin);
-adminVoucherRouter.get('/', async (_req, res) => res.json(await db.select().from(vouchers).orderBy(desc(vouchers.isActive)).limit(200)));
+adminVoucherRouter.get('/', async (_req, res) => res.json(await db.select().from(vouchers).orderBy(desc(vouchers.isActive)).limit(1000)));
 adminVoucherRouter.post('/', async (req, res) => {
   const { productIds, ...input } = parse(voucherInput, req.body);
   const row = await db.transaction(async tx => {

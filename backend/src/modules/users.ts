@@ -42,7 +42,7 @@ adminUserRouter.get('/', async (_req, res) => {
     LEFT JOIN orders o ON o.user_id = u.id
     GROUP BY u.id
     ORDER BY u.created_at DESC
-    LIMIT 200
+    LIMIT 10000
   `);
 
   const list = result.rows.map(row => ({
@@ -90,7 +90,7 @@ adminUserRouter.get('/:id/orders', async (req, res) => {
     WHERE o.user_id = $1
     GROUP BY o.id
     ORDER BY o.created_at DESC
-    LIMIT 200
+    LIMIT 10000
   `, [userId]);
 
   const list = result.rows.map(row => {
