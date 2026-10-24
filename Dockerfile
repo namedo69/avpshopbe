@@ -4,7 +4,7 @@ WORKDIR /app
 
 # Copy package files from backend directory
 COPY backend/package*.json ./
-RUN npm ci
+RUN npm install
 
 # Copy source code and config
 COPY backend/ ./

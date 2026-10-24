@@ -11,7 +11,6 @@ export class AppError extends Error {
 }
 
 const rawOrigins = process.env.FRONTEND_ORIGIN || 'http://localhost:5173';
-// Hỗ trợ danh sách nhiều origin cách nhau bằng dấu phẩy
 export const allowedOrigins = rawOrigins.split(',').map(s => s.trim().replace(/\/$/, ''));
 
 export const env = {
@@ -22,8 +21,7 @@ export const env = {
 };
 
 export function assertConfig() {
-  if (!process.env.TURSO_DATABASE_URL) throw new Error('TURSO_DATABASE_URL is required');
-  if (process.env.NODE_ENV === 'production' && !process.env.TURSO_AUTH_TOKEN) throw new Error('TURSO_AUTH_TOKEN is required in production');
+  if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
   if (env.accessSecret.length < 32) throw new Error('JWT_ACCESS_SECRET must be at least 32 characters');
   if (env.sepaySecret.length < 16) throw new Error('SEPAY_WEBHOOK_SECRET must be at least 16 characters');
 }
@@ -35,7 +33,6 @@ export const safeEqual = (a: string, b: string) => {
 };
 
 export function verifySepay(raw: Buffer, req: Request) {
-  // 1. Kiểm tra qua API Key trong Header Authorization: Apikey <KEY>
   const authHeader = req.header('authorization') ?? '';
   if (authHeader) {
     const token = authHeader.replace(/^Apikey\s+/i, '').trim();
@@ -43,8 +40,6 @@ export function verifySepay(raw: Buffer, req: Request) {
       return true;
     }
   }
-
-  // 2. Kiểm tra qua chữ ký HMAC-SHA256 (x-sepay-signature)
   const signature = req.header('x-sepay-signature') ?? '';
   const timestamp = req.header('x-sepay-timestamp') ?? '';
   if (signature && timestamp) {
@@ -56,7 +51,6 @@ export function verifySepay(raw: Buffer, req: Request) {
       }
     }
   }
-
   return false;
 }
 

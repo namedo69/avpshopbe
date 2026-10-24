@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import argon2 from 'argon2';
 import { eq } from 'drizzle-orm';
-import { db, client } from './db/index.js';
+import { db, pool } from './db/index.js';
 import { bankAccounts, providers, users, wallets } from './db/schema.js';
 
 async function main() {
@@ -21,4 +21,4 @@ async function main() {
   if (process.env.PMOD_BASE_URL) await db.insert(providers).values({ code: 'pmod', name: 'PMOD', baseUrl: process.env.PMOD_BASE_URL }).onConflictDoNothing();
   process.stdout.write('Initial setup complete\n');
 }
-main().catch(error => { process.stderr.write(String(error) + '\n'); process.exitCode = 1; }).finally(() => client.close());
+main().catch(error => { process.stderr.write(String(error) + '\n'); process.exitCode = 1; }).finally(() => pool.end());

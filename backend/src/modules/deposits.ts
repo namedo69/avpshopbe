@@ -39,20 +39,20 @@ async function creditDeposit(depositId: string, reference: string, eventId?: str
   try {
     await client.query('BEGIN');
     if (eventId) {
-      const inserted = await client.query("INSERT INTO payment_webhook_events(provider,event_id,payload,status,deposit_id) VALUES('sepay',$1,$2,'received',$3) ON CONFLICT(provider,event_id) DO NOTHING RETURNING id", [eventId, JSON.stringify(payload), depositId]);
+      const inserted = await client.query("INSERT INTO payment_webhook_events(provider,event_id,payload,status,deposit_id) VALUES('sepay',$1,$2::jsonb,'received',$3) ON CONFLICT(provider,event_id) DO NOTHING RETURNING id", [eventId, JSON.stringify(payload), depositId]);
       if (!inserted.rows[0]) { await client.query('ROLLBACK'); return false; }
     }
-    const claim = await client.query<{ id: string; user_id: string; amount: number }>("UPDATE deposits SET status='completed', completed_at=(unixepoch()*1000), sepay_transaction_id=$2 WHERE id=$1 AND (status='pending' OR ($3 AND status='expired')) AND ($3 OR expires_at>(unixepoch()*1000)) RETURNING id,user_id,amount", [depositId, eventId ?? null, allowExpired]);
+    const claim = await client.query<{ id: string; user_id: string; amount: number }>("UPDATE deposits SET status='completed', completed_at=NOW(), sepay_transaction_id=$2 WHERE id=$1 AND (status='pending' OR ($3::boolean AND status='expired')) AND ($3::boolean OR expires_at>NOW()) RETURNING id,user_id,amount", [depositId, eventId ?? null, allowExpired]);
     const row = claim.rows[0];
     if (!row) {
-      if (eventId) { await client.query("UPDATE payment_webhook_events SET status='ignored',error_message='Deposit no longer pending',processed_at=(unixepoch()*1000) WHERE provider='sepay' AND event_id=$1", [eventId]); await client.query('COMMIT'); }
+      if (eventId) { await client.query("UPDATE payment_webhook_events SET status='ignored',error_message='Deposit no longer pending',processed_at=NOW() WHERE provider='sepay' AND event_id=$1", [eventId]); await client.query('COMMIT'); }
       else await client.query('ROLLBACK');
       return false;
     }
     const balance = await client.query<{ balance_before: number; balance_after: number }>('UPDATE wallets SET balance_amount=balance_amount+$2, version=version+1 WHERE user_id=$1 RETURNING balance_amount-$2 AS balance_before,balance_amount AS balance_after', [row.user_id, row.amount]);
     if (!balance.rows[0]) throw new Error('Wallet missing');
     await client.query("INSERT INTO wallet_transactions(user_id,type,amount,balance_before,balance_after,reference_type,reference_id,status) VALUES($1,'deposit',$2,$3,$4,'deposit',$5,'completed')", [row.user_id, row.amount, balance.rows[0].balance_before, balance.rows[0].balance_after, reference]);
-    if (eventId) await client.query("UPDATE payment_webhook_events SET status='processed',processed_at=(unixepoch()*1000) WHERE provider='sepay' AND event_id=$1", [eventId]);
+    if (eventId) await client.query("UPDATE payment_webhook_events SET status='processed',processed_at=NOW() WHERE provider='sepay' AND event_id=$1", [eventId]);
     await client.query('COMMIT'); return true;
   } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
 }
@@ -77,13 +77,11 @@ webhookRouter.post('/sepay', async (req, res) => {
 // Admin Bank Accounts & Deposits Management
 adminDepositRouter.use(requireUser, requireAdmin);
 
-// Lấy thông tin tài khoản ngân hàng nhận tiền
 adminDepositRouter.get('/bank-account', async (_req, res) => {
   const [bank] = await db.select().from(bankAccounts).limit(1);
   res.json(bank ?? null);
 });
 
-// Cập nhật hoặc thêm tài khoản ngân hàng nhận tiền
 const bankAccountSchema = z.object({
   bankCode: z.string().trim().min(2).max(20).toUpperCase(),
   accountNumber: z.string().trim().min(4).max(50),

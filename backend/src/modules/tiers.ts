@@ -209,7 +209,7 @@ adminTierRouter.get('/:id/prices', async (req, res) => {
       tpp.id AS price_id
     FROM products p
     LEFT JOIN tier_product_prices tpp ON tpp.product_id = p.id AND tpp.tier_id = $1
-    WHERE p.is_active = 1
+    WHERE p.is_active = true
     ORDER BY p.sort_order ASC, p.created_at ASC
   `, [tierId]);
 
@@ -254,8 +254,8 @@ adminTierRouter.post('/:id/prices', async (req, res) => {
 
   if (existing.rows.length > 0) {
     await sqlClient.query(
-      'UPDATE tier_product_prices SET custom_price_amount = $1, updated_at = $2 WHERE tier_id = $3 AND product_id = $4',
-      [customPriceAmount, Date.now(), tierId, productId]
+      'UPDATE tier_product_prices SET custom_price_amount = $1, updated_at = NOW() WHERE tier_id = $2 AND product_id = $3',
+      [customPriceAmount, tierId, productId]
     );
   } else {
     await sqlClient.query(

@@ -20,7 +20,7 @@ const checkoutSchema = z.object({
   items: z.array(checkoutItemSchema).min(1).max(100),
   voucherCode: z.string().optional(),
   customerNote: z.string().max(1000).optional(),
-  splitOrders: z.boolean().default(false), // Cho phép tách thành nhiều đơn riêng biệt
+  splitOrders: z.boolean().default(false),
 });
 
 walletRouter.use(requireUser);
@@ -86,12 +86,11 @@ orderRouter.post('/', async (req, res) => {
         }
       }
 
-      // Tính đơn giá theo loại người dùng (Admin giảm 100%, CTV giảm theo %, hoặc giá cấu hình riêng)
       const basePrice = Number(product.sale_price_amount ?? product.price_amount);
       let effectiveUnitPrice = basePrice;
 
       if (user.role === 'admin' || tierDiscountPercent >= 100) {
-        effectiveUnitPrice = 0; // Admin mặc định miễn phí 100%
+        effectiveUnitPrice = 0;
       } else {
         const customTier = await client.query(
           'SELECT custom_price_amount FROM tier_product_prices WHERE tier_id=$1 AND product_id=$2',
@@ -120,7 +119,7 @@ orderRouter.post('/', async (req, res) => {
 
     if (!Number.isSafeInteger(subtotal) || subtotal > 1_000_000_000_000) throw new AppError(400, 'AMOUNT_OVERFLOW', 'Tổng tiền quá lớn');
 
-    // 3. Tính toán Voucher trên TỔNG GIÁ TRỊ TOÀN BỘ ĐƠN HÀNG
+    // 3. Tính toán Voucher
     let voucherId: string | null = null;
     let totalDiscount = 0;
 
@@ -156,7 +155,7 @@ orderRouter.post('/', async (req, res) => {
 
     const finalTotalPayment = Math.max(0, subtotal - totalDiscount);
 
-    // 4. Trừ tiền ví (Nếu số tiền > 0)
+    // 4. Trừ tiền ví
     let walletBefore = 0;
     let walletAfter = 0;
 
@@ -182,7 +181,6 @@ orderRouter.post('/', async (req, res) => {
 
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i]!;
-        // Phân bổ giảm giá vào từng đơn tương ứng
         let lineDiscount = 0;
         if (totalDiscount > 0) {
           if (i === lines.length - 1) {
@@ -203,7 +201,7 @@ orderRouter.post('/', async (req, res) => {
         const order = orderResult.rows[0]!;
 
         await client.query(
-          'INSERT INTO order_items(order_id,product_id,product_name,unit_price,quantity,total_amount,customer_input) VALUES($1,$2,$3,$4,$5,$6,$7)',
+          'INSERT INTO order_items(order_id,product_id,product_name,unit_price,quantity,total_amount,customer_input) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb)',
           [order.id, line.productId, line.name, line.unitPrice, line.quantity, line.total, JSON.stringify(line.customerInput)]
         );
 
@@ -216,7 +214,6 @@ orderRouter.post('/', async (req, res) => {
         createdOrders.push(order);
       }
 
-      // Ghi 1 giao dịch ví cho toàn bộ lần thanh toán
       await client.query(
         "INSERT INTO wallet_transactions(user_id,type,amount,balance_before,balance_after,reference_type,reference_id,status,description) VALUES($1,'purchase',$2,$3,$4,'order',$5,'completed',$6)",
         [req.user!.id, -finalTotalPayment, walletBefore, walletAfter, key, `Thanh toán ${lines.length} đơn hàng (${input.voucherCode ? `Áp mã ${input.voucherCode}` : 'Không áp mã'})`]
@@ -232,7 +229,7 @@ orderRouter.post('/', async (req, res) => {
       return;
     }
 
-    // 6. Trường hợp đơn thông thường (1 đơn gộp hoặc 1 item)
+    // 6. Trường hợp đơn thông thường
     const orderResult = await client.query(
       'INSERT INTO orders(order_code,user_id,idempotency_key,request_hash,status,subtotal_amount,discount_amount,total_amount,voucher_id,customer_note) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
       [code('ORD'), req.user!.id, key, requestHash, 'queued', subtotal, totalDiscount, finalTotalPayment, voucherId, input.customerNote ?? null]
@@ -242,7 +239,7 @@ orderRouter.post('/', async (req, res) => {
 
     for (const line of lines) {
       await client.query(
-        'INSERT INTO order_items(order_id,product_id,product_name,unit_price,quantity,total_amount,customer_input) VALUES($1,$2,$3,$4,$5,$6,$7)',
+        'INSERT INTO order_items(order_id,product_id,product_name,unit_price,quantity,total_amount,customer_input) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb)',
         [order.id, line.productId, line.name, line.unitPrice, line.quantity, line.total, JSON.stringify(line.customerInput)]
       );
     }
@@ -259,7 +256,7 @@ orderRouter.post('/', async (req, res) => {
     await client.query("INSERT INTO order_status_logs(order_id,to_status,actor_type,actor_id) VALUES($1,'queued','customer',$2)", [order.id, req.user!.id]);
 
     if (hasAnyProvider) {
-      await client.query("INSERT INTO outbox_jobs(type,aggregate_id,payload) VALUES('SEND_PROVIDER_ORDER',$1,$2)", [order.id, '{}']);
+      await client.query("INSERT INTO outbox_jobs(type,aggregate_id,payload) VALUES('SEND_PROVIDER_ORDER',$1,'{}'::jsonb)", [order.id]);
     }
 
     await client.query('COMMIT');
@@ -276,17 +273,17 @@ orderRouter.get('/', async (req, res) => {
   const result = await sqlClient.query(`
     SELECT o.*,
       COALESCE(
-        json_group_array(
-          json_object(
+        json_agg(
+          json_build_object(
             'id', oi.id,
             'productId', oi.product_id,
             'productName', oi.product_name,
             'unitPrice', oi.unit_price,
             'quantity', oi.quantity,
             'totalAmount', oi.total_amount,
-            'customerInput', json(oi.customer_input)
+            'customerInput', oi.customer_input
           )
-        ), '[]'
+        ) FILTER (WHERE oi.id IS NOT NULL), '[]'::json
       ) AS items
     FROM orders o
     LEFT JOIN order_items oi ON oi.order_id = o.id
@@ -296,20 +293,7 @@ orderRouter.get('/', async (req, res) => {
     LIMIT 100
   `, [req.user!.id]);
 
-  const list = result.rows.map(row => {
-    let items = [];
-    try {
-      items = typeof row.items === 'string' ? JSON.parse(row.items) : row.items;
-      if (Array.isArray(items) && items.length === 1 && !items[0].id) {
-        items = [];
-      }
-    } catch {
-      items = [];
-    }
-    return { ...row, items };
-  });
-
-  res.json(list);
+  res.json(result.rows);
 });
 
 orderRouter.get('/:orderCode', async (req, res) => {
@@ -321,56 +305,86 @@ orderRouter.get('/:orderCode', async (req, res) => {
 adminOrderRouter.use(requireUser, requireAdmin);
 
 adminOrderRouter.get('/', async (req, res) => {
-  const userId = req.query.userId ? String(req.query.userId) : null;
-  const whereClause = userId ? 'WHERE o.user_id = $1' : '';
-  const params = userId ? [userId] : [];
-  const limit = Math.min(Number(req.query.limit) || 10000, 50000);
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const limit = Math.min(Math.max(1, Number(req.query.limit) || 20), 100);
+  const offset = (page - 1) * limit;
 
+  const conditions: string[] = [];
+  const params: any[] = [];
+  let paramIdx = 1;
+
+  // Filter by userId
+  if (req.query.userId) {
+    conditions.push(`o.user_id = $${paramIdx++}`);
+    params.push(String(req.query.userId));
+  }
+
+  // Filter by status (supports comma-separated for groups like "queued,sending,processing")
+  if (req.query.status) {
+    const statuses = String(req.query.status).split(',').map(s => s.trim()).filter(Boolean);
+    if (statuses.length === 1) {
+      conditions.push(`o.status = $${paramIdx++}`);
+      params.push(statuses[0]);
+    } else if (statuses.length > 1) {
+      const placeholders = statuses.map(() => `$${paramIdx++}`).join(',');
+      conditions.push(`o.status IN (${placeholders})`);
+      params.push(...statuses);
+    }
+  }
+
+  // Search by orderCode, user email, or customerInput values
+  if (req.query.search) {
+    const searchTerm = `%${String(req.query.search).trim().toLowerCase()}%`;
+    conditions.push(`(LOWER(o.order_code) LIKE $${paramIdx} OR LOWER(u.email) LIKE $${paramIdx} OR LOWER(u.name) LIKE $${paramIdx} OR EXISTS (SELECT 1 FROM order_items oi2 WHERE oi2.order_id = o.id AND LOWER(oi2.customer_input::text) LIKE $${paramIdx}))`);
+    params.push(searchTerm);
+    paramIdx++;
+  }
+
+  const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
+
+  // Count total matching rows
+  const countResult = await sqlClient.query(
+    `SELECT count(DISTINCT o.id)::int AS total FROM orders o LEFT JOIN users u ON u.id = o.user_id ${whereClause}`,
+    params
+  );
+  const total = countResult.rows[0]?.total ?? 0;
+
+  // Fetch paginated data
+  const dataParams = [...params, limit, offset];
   const result = await sqlClient.query(`
     SELECT o.*,
-      json_object('id', u.id, 'email', u.email, 'name', u.name) AS "user",
+      json_build_object('id', u.id, 'email', u.email, 'name', u.name) AS "user",
       COALESCE(
-        json_group_array(
-          json_object(
+        json_agg(
+          json_build_object(
             'id', oi.id,
             'productId', oi.product_id,
             'productName', oi.product_name,
             'unitPrice', oi.unit_price,
             'quantity', oi.quantity,
             'totalAmount', oi.total_amount,
-            'customerInput', json(oi.customer_input)
+            'customerInput', oi.customer_input
           )
-        ), '[]'
+        ) FILTER (WHERE oi.id IS NOT NULL), '[]'::json
       ) AS items
     FROM orders o
     LEFT JOIN users u ON u.id = o.user_id
     LEFT JOIN order_items oi ON oi.order_id = o.id
     ${whereClause}
-    GROUP BY o.id
+    GROUP BY o.id, u.id, u.email, u.name
     ORDER BY o.created_at DESC
-    LIMIT ${limit}
-  `, params);
+    LIMIT $${paramIdx++} OFFSET $${paramIdx++}
+  `, dataParams);
 
-  const list = result.rows.map(row => {
-    let items = [];
-    try {
-      items = typeof row.items === 'string' ? JSON.parse(row.items) : row.items;
-      if (Array.isArray(items) && items.length === 1 && !items[0].id) {
-        items = [];
-      }
-    } catch {
-      items = [];
-    }
-    let user = null;
-    try {
-      user = typeof row.user === 'string' ? JSON.parse(row.user) : row.user;
-    } catch {
-      user = null;
-    }
-    return { ...row, items, user };
+  res.json({
+    data: result.rows,
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+    },
   });
-
-  res.json(list);
 });
 
 adminOrderRouter.get('/:id', async (req, res) => {
@@ -408,13 +422,12 @@ adminOrderRouter.post('/batch-status', async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Chuyển hàng loạt bằng 1 câu lệnh SQL duy nhất
     const inClause = ids.map((_, i) => `$${i + 2}`).join(',');
     const updateQuery = `
       UPDATE orders
       SET status = $1,
-          updated_at = (unixepoch() * 1000),
-          completed_at = CASE WHEN $1 = 'completed' THEN (unixepoch() * 1000) ELSE completed_at END
+          updated_at = NOW(),
+          completed_at = CASE WHEN $1 = 'completed' THEN NOW() ELSE completed_at END
       WHERE id IN (${inClause})
       RETURNING id, order_code, status
     `;
@@ -422,9 +435,8 @@ adminOrderRouter.post('/batch-status', async (req, res) => {
     const result = await client.query(updateQuery, [status, ...ids]);
     const updatedRows = result.rows;
 
-    // Ghi audit logs 1 lần cho batch
     await client.query(
-      "INSERT INTO audit_logs(actor_id, action, target_type, target_id, metadata) VALUES($1, 'order.batch_status', 'orders', $2, $3)",
+      "INSERT INTO audit_logs(actor_id, action, target_type, target_id, metadata) VALUES($1, 'order.batch_status', 'orders', $2, $3::jsonb)",
       [req.user!.id, 'batch', JSON.stringify({ count: updatedRows.length, status, reason })]
     );
 
@@ -452,9 +464,9 @@ adminOrderRouter.patch('/:id/status', async (req, res) => {
     if (!row) throw new AppError(404, 'NOT_FOUND', 'Không tìm thấy đơn hàng');
     if (!transitions[row.status]?.includes(status)) throw new AppError(409, 'INVALID_TRANSITION', 'Chuyển trạng thái không hợp lệ');
 
-    await client.query("UPDATE orders SET status=$2,updated_at=(unixepoch()*1000),completed_at=CASE WHEN $2='completed' THEN (unixepoch()*1000) ELSE completed_at END WHERE id=$1", [String(row.id), status]);
+    await client.query("UPDATE orders SET status=$2,updated_at=NOW(),completed_at=CASE WHEN $2='completed' THEN NOW() ELSE completed_at END WHERE id=$1", [String(row.id), status]);
     await client.query("INSERT INTO order_status_logs(order_id,from_status,to_status,actor_type,actor_id,reason) VALUES($1,$2,$3,'admin',$4,$5)", [row.id, row.status, status, req.user!.id, reason]);
-    await client.query("INSERT INTO audit_logs(actor_id,action,target_type,target_id,metadata) VALUES($1,'order.status','order',$2,$3)", [req.user!.id, row.id, JSON.stringify({ status, reason })]);
+    await client.query("INSERT INTO audit_logs(actor_id,action,target_type,target_id,metadata) VALUES($1,'order.status','order',$2,$3::jsonb)", [req.user!.id, row.id, JSON.stringify({ status, reason })]);
     await client.query('COMMIT');
     res.json({ status });
   } catch (error) {
@@ -479,9 +491,9 @@ adminOrderRouter.post('/:id/refund', async (req, res) => {
     if (!wallet.rows[0]) throw new Error('Wallet missing');
 
     await client.query("INSERT INTO wallet_transactions(user_id,type,amount,balance_before,balance_after,reference_type,reference_id,status) VALUES($1,'refund',$2,$3,$4,'refund',$5,'completed')", [row.user_id, row.total_amount, wallet.rows[0].before, wallet.rows[0].after, `refund:order:${row.id}`]);
-    await client.query("UPDATE orders SET status='refunded',updated_at=(unixepoch()*1000) WHERE id=$1", [String(row.id)]);
+    await client.query("UPDATE orders SET status='refunded',updated_at=NOW() WHERE id=$1", [String(row.id)]);
     await client.query("INSERT INTO order_status_logs(order_id,from_status,to_status,actor_type,actor_id,reason) VALUES($1,'failed','refunded','admin',$2,$3)", [row.id, req.user!.id, reason]);
-    await client.query("INSERT INTO audit_logs(actor_id,action,target_type,target_id,metadata) VALUES($1,'order.refund','order',$2,$3)", [req.user!.id, row.id, JSON.stringify({ reason })]);
+    await client.query("INSERT INTO audit_logs(actor_id,action,target_type,target_id,metadata) VALUES($1,'order.refund','order',$2,$3::jsonb)", [req.user!.id, row.id, JSON.stringify({ reason })]);
     await client.query('COMMIT');
     res.json({ refunded: true });
   } catch (error) {
@@ -496,6 +508,7 @@ adminOrderRouter.post('/:id/retry', async (req, res) => {
   const [row] = await db.select().from(orders).where(eq(orders.id, String(req.params.id)));
   if (!row || row.status !== 'failed') throw new AppError(409, 'INVALID_TRANSITION', 'Đơn không thể gửi lại');
   await db.insert(auditLogs).values({ actorId: req.user!.id, action: 'order.retry', targetType: 'order', targetId: row.id });
-  await sqlClient.query("INSERT INTO outbox_jobs(type,aggregate_id,payload) VALUES('SEND_PROVIDER_ORDER',$1,'{}')", [row.id]);
+  await sqlClient.query("INSERT INTO outbox_jobs(type,aggregate_id,payload) VALUES('SEND_PROVIDER_ORDER',$1,'{}'::jsonb)", [row.id]);
   res.json({ queued: true });
 });
+
