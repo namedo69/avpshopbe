@@ -26,21 +26,31 @@ adminUserRouter.get('/', async (_req, res) => {
       COALESCE(ut.name, CASE WHEN u.role = 'admin' THEN 'Quản trị viên' ELSE 'Thành viên' END) AS "tierName",
       COALESCE(ut.code, CASE WHEN u.role = 'admin' THEN 'admin' ELSE 'thanh_vien' END) AS "tierCode",
       COALESCE(ut.discount_percent, CASE WHEN u.role = 'admin' THEN 100 ELSE 0 END) AS "tierDiscount",
-      COUNT(DISTINCT o.id) AS "totalOrders",
-      COUNT(DISTINCT CASE WHEN o.status = 'completed' THEN o.id END) AS "completedOrders",
-      COUNT(DISTINCT CASE WHEN o.status IN ('queued', 'sending', 'processing') THEN o.id END) AS "processingOrders",
-      COALESCE(SUM(CASE WHEN o.status = 'completed' THEN o.total_amount ELSE 0 END), 0) AS "totalSpent",
-      COALESCE((
-        SELECT SUM(oi.quantity)
-        FROM orders o2
-        JOIN order_items oi ON oi.order_id = o2.id
-        WHERE o2.user_id = u.id
-      ), 0) AS "totalCodes"
+      COALESCE(os.total_orders, 0) AS "totalOrders",
+      COALESCE(os.completed_orders, 0) AS "completedOrders",
+      COALESCE(os.processing_orders, 0) AS "processingOrders",
+      COALESCE(os.total_spent, 0) AS "totalSpent",
+      COALESCE(os.total_codes, 0) AS "totalCodes"
     FROM users u
     LEFT JOIN wallets w ON w.user_id = u.id
     LEFT JOIN user_tiers ut ON ut.id = u.tier_id
-    LEFT JOIN orders o ON o.user_id = u.id
-    GROUP BY u.id
+    LEFT JOIN (
+      SELECT 
+        sub.user_id,
+        COUNT(*) AS total_orders,
+        SUM(CASE WHEN sub.status = 'completed' THEN 1 ELSE 0 END) AS completed_orders,
+        SUM(CASE WHEN sub.status IN ('queued', 'sending', 'processing') THEN 1 ELSE 0 END) AS processing_orders,
+        SUM(CASE WHEN sub.status = 'completed' THEN sub.total_amount ELSE 0 END) AS total_spent,
+        SUM(sub.item_qty) AS total_codes
+      FROM (
+        SELECT o.id, o.user_id, o.status, o.total_amount,
+          COALESCE(SUM(oi.quantity), 0) AS item_qty
+        FROM orders o
+        LEFT JOIN order_items oi ON oi.order_id = o.id
+        GROUP BY o.id
+      ) sub
+      GROUP BY sub.user_id
+    ) os ON os.user_id = u.id
     ORDER BY u.created_at DESC
     LIMIT 10000
   `);
