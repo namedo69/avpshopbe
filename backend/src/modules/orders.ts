@@ -460,7 +460,7 @@ adminOrderRouter.get('/', async (req, res) => {
   );
   const total = countResult.rows[0]?.total ?? 0;
 
-  // Fetch paginated data
+  // Fetch paginated data kèm thông tin provider tiến độ
   const dataParams = [...params, limit, offset];
   const result = await sqlClient.query(`
     SELECT o.*,
@@ -477,12 +477,14 @@ adminOrderRouter.get('/', async (req, res) => {
             'customerInput', oi.customer_input
           )
         ) FILTER (WHERE oi.id IS NOT NULL), '[]'::json
-      ) AS items
+      ) AS items,
+      po.response_payload AS provider_response
     FROM orders o
     LEFT JOIN users u ON u.id = o.user_id
     LEFT JOIN order_items oi ON oi.order_id = o.id
+    LEFT JOIN provider_orders po ON po.order_id = o.id
     ${whereClause}
-    GROUP BY o.id, u.id, u.email, u.name
+    GROUP BY o.id, u.id, u.email, u.name, po.response_payload
     ORDER BY o.created_at DESC
     LIMIT $${paramIdx++} OFFSET $${paramIdx++}
   `, dataParams);
