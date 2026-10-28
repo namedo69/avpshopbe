@@ -5,6 +5,7 @@ import { db } from '../db/index.js';
 import { orders, orderItems, orderStatusLogs, providerOrders, vouchers, voucherProducts, voucherUsages, walletTransactions, wallets, products, auditLogs } from '../db/schema.js';
 import { sqlClient } from '../db/sql.js';
 import { AppError, amountSchema, calcDiscount, code, parse, requireAdmin, requireUser, sha256 } from '../lib/core.js';
+import { chungSucClient, extractEventCode } from './chungsuc-adapter.js';
 
 export const orderRouter = Router();
 export const adminOrderRouter = Router();
@@ -71,13 +72,28 @@ orderRouter.post('/', async (req, res) => {
     const lines: { productId: string; name: string; quantity: number; unitPrice: number; total: number; customerInput: Record<string, unknown> }[] = [];
     let hasAnyProvider = false;
 
+    // Kiểm tra xem provider Chung Sức có đang được bật trong hệ thống không
+    const csProviderRes = await client.query("SELECT is_active FROM providers WHERE code='chungsuc' LIMIT 1");
+    const isChungSucActive = Boolean(csProviderRes.rows[0]?.is_active);
+
     for (const item of input.items) {
       const result = await client.query('SELECT * FROM products WHERE id=$1 AND is_active=true', [item.productId]);
       const product = result.rows[0];
       if (!product) throw new AppError(400, 'INVALID_PRODUCT', 'Sản phẩm không khả dụng');
 
       const mapping = await client.query('SELECT 1 FROM provider_products pp JOIN providers p ON p.id=pp.provider_id WHERE pp.product_id=$1 AND pp.is_active=true AND p.is_active=true LIMIT 1', [item.productId]);
-      if (mapping.rows[0]) hasAnyProvider = true;
+      if (mapping.rows[0] || isChungSucActive) hasAnyProvider = true;
+
+      // Chuẩn hóa và làm sạch mã sự kiện trong customerInput
+      const cleanedInput: Record<string, unknown> = { ...item.customerInput };
+      const rawCode = cleanedInput.accountId || cleanedInput.code || cleanedInput.eventCode;
+      if (rawCode) {
+        const cleanCode = extractEventCode(rawCode);
+        if (cleanCode) {
+          cleanedInput.code = cleanCode;
+          cleanedInput.accountId = cleanCode;
+        }
+      }
 
       const schema = product.input_schema ?? {};
       if (Array.isArray(schema.required)) {
@@ -113,7 +129,7 @@ orderRouter.post('/', async (req, res) => {
         quantity: item.quantity,
         unitPrice: effectiveUnitPrice,
         total,
-        customerInput: item.customerInput,
+        customerInput: cleanedInput,
       });
     }
 
@@ -211,6 +227,10 @@ orderRouter.post('/', async (req, res) => {
 
         await client.query("INSERT INTO order_status_logs(order_id,to_status,actor_type,actor_id) VALUES($1,'queued','customer',$2)", [order.id, req.user!.id]);
 
+        if (hasAnyProvider) {
+          await client.query("INSERT INTO outbox_jobs(type,aggregate_id,payload) VALUES('SEND_PROVIDER_ORDER',$1,'{}'::jsonb)", [order.id]);
+        }
+
         createdOrders.push(order);
       }
 
@@ -299,7 +319,98 @@ orderRouter.get('/', async (req, res) => {
 orderRouter.get('/:orderCode', async (req, res) => {
   const [order] = await db.select().from(orders).where(and(eq(orders.userId, req.user!.id), eq(orders.orderCode, String(req.params.orderCode))));
   if (!order) throw new AppError(404, 'NOT_FOUND', 'Không tìm thấy đơn hàng');
-  res.json({ ...order, items: await db.select().from(orderItems).where(eq(orderItems.orderId, order.id)) });
+
+  // Lấy thêm thông tin đối tác nếu có
+  const providerOrderRes = await sqlClient.query(`
+    SELECT po.*, p.code as provider_code, p.name as provider_name
+    FROM provider_orders po
+    JOIN providers p ON p.id = po.provider_id
+    WHERE po.order_id = $1
+    LIMIT 1
+  `, [order.id]);
+  const providerInfo = providerOrderRes.rows[0];
+
+  res.json({
+    ...order,
+    items: await db.select().from(orderItems).where(eq(orderItems.orderId, order.id)),
+    providerOrder: providerInfo ? {
+      externalOrderId: providerInfo.external_order_id,
+      status: providerInfo.status,
+      response: providerInfo.response_payload,
+    } : null,
+  });
+});
+
+/**
+ * Endpoint tra cứu tiến độ thời gian thực cho FE (Polling mỗi 5s)
+ * GET /api/v1/orders/:orderCode/progress
+ */
+orderRouter.get('/:orderCode/progress', async (req, res) => {
+  const [order] = await db.select().from(orders).where(and(eq(orders.userId, req.user!.id), eq(orders.orderCode, String(req.params.orderCode))));
+  if (!order) throw new AppError(404, 'NOT_FOUND', 'Không tìm thấy đơn hàng');
+
+  const providerOrderRes = await sqlClient.query(`
+    SELECT po.*, p.code as provider_code
+    FROM provider_orders po
+    JOIN providers p ON p.id = po.provider_id
+    WHERE po.order_id = $1
+    LIMIT 1
+  `, [order.id]);
+  const provOrder = providerOrderRes.rows[0];
+
+  let ticketsTarget = 0;
+  let ticketsConfirmed = 0;
+  let completedRequests = 0;
+  let currentStatus = order.status;
+
+  if (provOrder && provOrder.provider_code === 'chungsuc' && provOrder.external_order_id) {
+    // Nếu đơn chưa xong và ChungSuc đã cấu hình, thử cập nhật nhanh
+    if (['queued', 'sending', 'processing'].includes(order.status) && chungSucClient.isConfigured()) {
+      try {
+        const live = await chungSucClient.getOrder(provOrder.external_order_id);
+        ticketsTarget = live.tickets_target || 0;
+        ticketsConfirmed = live.tickets_confirmed || 0;
+        completedRequests = live.completed_requests || 0;
+
+        let mappedStatus = order.status;
+        if (live.status === 'completed') mappedStatus = 'completed';
+        else if (live.status === 'processing') mappedStatus = 'processing';
+        else if (live.status === 'cancelled') mappedStatus = 'cancelled';
+
+        if (mappedStatus !== order.status) {
+          currentStatus = mappedStatus;
+          await sqlClient.query(
+            "UPDATE orders SET status=$1, updated_at=NOW(), completed_at=CASE WHEN $1='completed' THEN NOW() ELSE completed_at END WHERE id=$2",
+            [mappedStatus, order.id]
+          );
+          await sqlClient.query(
+            "UPDATE provider_orders SET status=$1, response_payload=$2::jsonb WHERE id=$3",
+            [mappedStatus, JSON.stringify(live), provOrder.id]
+          );
+        }
+      } catch {
+        // Nếu lỗi mạng, fallback đọc từ response_payload cũ đã lưu
+        const oldResp = provOrder.response_payload || {};
+        ticketsTarget = oldResp.tickets_target || 0;
+        ticketsConfirmed = oldResp.tickets_confirmed || 0;
+        completedRequests = oldResp.completed_requests || 0;
+      }
+    } else {
+      const resp = provOrder.response_payload || {};
+      ticketsTarget = resp.tickets_target || 0;
+      ticketsConfirmed = resp.tickets_confirmed || 0;
+      completedRequests = resp.completed_requests || 0;
+    }
+  }
+
+  res.json({
+    orderCode: order.orderCode,
+    status: currentStatus,
+    ticketsTarget,
+    ticketsConfirmed,
+    completedRequests,
+    progressPercent: ticketsTarget > 0 ? Math.min(100, Math.round((ticketsConfirmed / ticketsTarget) * 100)) : (currentStatus === 'completed' ? 100 : 0),
+  });
 });
 
 adminOrderRouter.use(requireUser, requireAdmin);
