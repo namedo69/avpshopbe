@@ -2,11 +2,31 @@ import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
 import { sqlClient } from './db/sql.js';
 import { chungSucClient, extractEventCode } from './modules/chungsuc-adapter.js';
+import { hasAvailableWorker, dispatchJobToWorker, emitOrderProgress } from './modules/ws.js';
 
 const workerId = randomUUID();
 
 /**
- * Xử lý job gửi đơn sang đối tác ChungSuc
+ * Determine the dispatch mode for ChungSuc orders.
+ *
+ * Priority:
+ *   1. If an AutoChungSuc desktop worker is connected via WebSocket -> dispatch locally
+ *   2. Otherwise fall back to the external chungsuc.io.vn API (if configured)
+ *
+ * This allows seamless transition: when a worker goes offline, orders
+ * automatically fall back to the external API, and vice versa.
+ */
+type DispatchMode = 'ws_worker' | 'external_api' | 'none';
+
+function getDispatchMode(): DispatchMode {
+  if (hasAvailableWorker()) return 'ws_worker';
+  if (chungSucClient.isConfigured()) return 'external_api';
+  return 'none';
+}
+
+/**
+ * Xử lý job gửi đơn - ưu tiên dispatch qua WebSocket tới AutoChungSuc worker,
+ * fallback sang external API nếu không có worker.
  */
 async function processSendProviderOrder(jobId: string, orderId: string) {
   // 1. Kiểm tra trạng thái đơn hàng và lấy cấu hình số request của sản phẩm
@@ -30,13 +50,7 @@ async function processSendProviderOrder(jobId: string, orderId: string) {
   const provider = provRes.rows[0];
 
   if (!provider) {
-    // Nếu provider đang TẮT, hoàn thành job mà không đẩy đơn (đơn giữ ở trạng thái queued cho admin xử lý tay)
     await sqlClient.query("UPDATE outbox_jobs SET status='completed', locked_at=NULL, last_error='ChungSuc provider is inactive' WHERE id=$1", [jobId]);
-    return;
-  }
-
-  if (!chungSucClient.isConfigured()) {
-    await sqlClient.query("UPDATE outbox_jobs SET status='failed', locked_at=NULL, last_error='ChungSuc API key missing' WHERE id=$1", [jobId]);
     return;
   }
 
@@ -50,7 +64,6 @@ async function processSendProviderOrder(jobId: string, orderId: string) {
     return;
   }
 
-  // Lấy hệ số request cấu hình trong gói sản phẩm (mặc định = 1)
   let requestsPerItem = 1;
   const pSchema = order.input_schema;
   if (pSchema && typeof pSchema === 'object') {
@@ -61,45 +74,92 @@ async function processSendProviderOrder(jobId: string, orderId: string) {
     }
   }
 
-  // Tổng request gửi ChungSuc = Số lượng khách đặt * Số request cấu hình của gói (mặc định 1)
   const itemQty = Math.max(1, Number(order.quantity) || 1);
   const quantity = Math.max(1, itemQty * requestsPerItem);
   const idempotencyKey = `cs_${order.order_code || order.id}`;
 
+  const mode = getDispatchMode();
+
+  if (mode === 'none') {
+    await sqlClient.query("UPDATE outbox_jobs SET status='failed', locked_at=NULL, last_error='No worker connected and ChungSuc API key missing' WHERE id=$1", [jobId]);
+    return;
+  }
+
   try {
-    const csResponse = await chungSucClient.createHomeOrder({
-      codes: [cleanCode],
-      quantity,
-      customerLabel: order.order_code,
-      idempotencyKey,
-    });
+    if (mode === 'ws_worker') {
+      // ─── Dispatch via WebSocket to AutoChungSuc worker ──────────────
+      const dispatched = dispatchJobToWorker({
+        jobId,
+        orderId: order.id,
+        orderCode: order.order_code,
+        code: cleanCode,
+        target: quantity * 38, // default 38 tickets per request for MXT mode
+        quantity,
+      });
 
-    const firstOrder = csResponse.orders?.[0];
-    const externalOrderId = firstOrder ? String(firstOrder.id) : null;
+      if (!dispatched) {
+        // Worker disconnected between check and dispatch; retry next tick
+        await sqlClient.query(
+          "UPDATE outbox_jobs SET status='pending', locked_at=NULL, locked_by=NULL, last_error='Worker disconnected during dispatch' WHERE id=$1",
+          [jobId]
+        );
+        return;
+      }
 
-    // Lưu thông tin đơn đối tác vào provider_orders
-    await sqlClient.query(`
-      INSERT INTO provider_orders(order_id, provider_id, external_order_id, idempotency_key, status, request_payload, response_payload)
-      VALUES($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb)
-      ON CONFLICT (idempotency_key) DO UPDATE
-      SET external_order_id = EXCLUDED.external_order_id,
-          status = EXCLUDED.status,
-          response_payload = EXCLUDED.response_payload
-    `, [
-      order.id,
-      provider.id,
-      externalOrderId,
-      idempotencyKey,
-      'processing',
-      JSON.stringify({ codes: [cleanCode], quantity, customerLabel: order.order_code }),
-      JSON.stringify(csResponse),
-    ]);
+      // Create provider_orders record for tracking
+      await sqlClient.query(`
+        INSERT INTO provider_orders(order_id, provider_id, external_order_id, idempotency_key, status, request_payload, response_payload)
+        VALUES($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb)
+        ON CONFLICT (idempotency_key) DO UPDATE
+        SET status = EXCLUDED.status,
+            response_payload = EXCLUDED.response_payload
+      `, [
+        order.id,
+        provider.id,
+        `ws_${order.order_code}`,  // local worker ID prefix
+        idempotencyKey,
+        'processing',
+        JSON.stringify({ codes: [cleanCode], quantity, mode: 'ws_worker', customerLabel: order.order_code }),
+        JSON.stringify({ dispatched: true, dispatchedAt: new Date().toISOString() }),
+      ]);
 
-    // Cập nhật trạng thái đơn hàng sang 'processing'
-    await sqlClient.query("UPDATE orders SET status='processing', updated_at=NOW() WHERE id=$1 AND status='queued'", [order.id]);
-    await sqlClient.query("INSERT INTO order_status_logs(order_id, from_status, to_status, actor_type, reason) VALUES($1, 'queued', 'processing', 'system', 'ChungSuc accepted order')", [order.id]);
+      await sqlClient.query("UPDATE orders SET status='processing', updated_at=NOW() WHERE id=$1 AND status='queued'", [order.id]);
+      await sqlClient.query("INSERT INTO order_status_logs(order_id, from_status, to_status, actor_type, reason) VALUES($1, 'queued', 'processing', 'system', 'Dispatched to AutoChungSuc worker via WebSocket')", [order.id]);
+      await sqlClient.query("UPDATE outbox_jobs SET status='completed', locked_at=NULL WHERE id=$1", [jobId]);
 
-    await sqlClient.query("UPDATE outbox_jobs SET status='completed', locked_at=NULL WHERE id=$1", [jobId]);
+    } else {
+      // ─── Fallback: dispatch via external chungsuc.io.vn API ─────────
+      const csResponse = await chungSucClient.createHomeOrder({
+        codes: [cleanCode],
+        quantity,
+        customerLabel: order.order_code,
+        idempotencyKey,
+      });
+
+      const firstOrder = csResponse.orders?.[0];
+      const externalOrderId = firstOrder ? String(firstOrder.id) : null;
+
+      await sqlClient.query(`
+        INSERT INTO provider_orders(order_id, provider_id, external_order_id, idempotency_key, status, request_payload, response_payload)
+        VALUES($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb)
+        ON CONFLICT (idempotency_key) DO UPDATE
+        SET external_order_id = EXCLUDED.external_order_id,
+            status = EXCLUDED.status,
+            response_payload = EXCLUDED.response_payload
+      `, [
+        order.id,
+        provider.id,
+        externalOrderId,
+        idempotencyKey,
+        'processing',
+        JSON.stringify({ codes: [cleanCode], quantity, mode: 'external_api', customerLabel: order.order_code }),
+        JSON.stringify(csResponse),
+      ]);
+
+      await sqlClient.query("UPDATE orders SET status='processing', updated_at=NOW() WHERE id=$1 AND status='queued'", [order.id]);
+      await sqlClient.query("INSERT INTO order_status_logs(order_id, from_status, to_status, actor_type, reason) VALUES($1, 'queued', 'processing', 'system', 'ChungSuc external API accepted order')", [order.id]);
+      await sqlClient.query("UPDATE outbox_jobs SET status='completed', locked_at=NULL WHERE id=$1", [jobId]);
+    }
   } catch (err: any) {
     const errorMsg = err.message || String(err);
     await sqlClient.query(
@@ -110,13 +170,15 @@ async function processSendProviderOrder(jobId: string, orderId: string) {
 }
 
 /**
- * Thăm dò và đồng bộ tiến độ các đơn hàng đang xử lý
+ * Thăm dò và đồng bộ tiến độ các đơn hàng đang xử lý.
+ * - Đơn dispatch qua WS: progress được worker push trực tiếp qua ws.ts event handlers.
+ *   Sync loop chỉ cần kiểm tra đơn external API.
+ * - Đơn dispatch qua external API: polling chungsuc.io.vn như cũ.
  */
 async function syncProcessingOrders() {
-  if (!chungSucClient.isConfigured()) return;
-
   const activeOrdersRes = await sqlClient.query(`
-    SELECT po.id as po_id, po.external_order_id, o.id as order_id, o.order_code
+    SELECT po.id as po_id, po.external_order_id, po.response_payload,
+           o.id as order_id, o.order_code, o.status as order_status
     FROM provider_orders po
     JOIN orders o ON o.id = po.order_id
     JOIN providers p ON p.id = po.provider_id
@@ -128,6 +190,17 @@ async function syncProcessingOrders() {
 
   for (const row of activeOrdersRes.rows) {
     try {
+      const externalId = String(row.external_order_id);
+
+      // Orders dispatched via WS have external_order_id starting with "ws_"
+      // Their progress is managed by ws.ts event handlers directly, skip here.
+      if (externalId.startsWith('ws_')) {
+        continue;
+      }
+
+      // External API orders: poll chungsuc.io.vn
+      if (!chungSucClient.isConfigured()) continue;
+
       const live = await chungSucClient.getOrder(row.external_order_id);
       let mappedStatus = 'processing';
       if (live.status === 'completed') mappedStatus = 'completed';
@@ -139,6 +212,17 @@ async function syncProcessingOrders() {
         SET status = $1, response_payload = $2::jsonb
         WHERE id = $3
       `, [mappedStatus, JSON.stringify(live), row.po_id]);
+
+      // Emit realtime progress to FE
+      emitOrderProgress(row.order_code, {
+        status: mappedStatus,
+        ticketsTarget: live.tickets_target || 0,
+        ticketsConfirmed: live.tickets_confirmed || 0,
+        completedRequests: live.completed_requests || 0,
+        progressPercent: live.tickets_target > 0
+          ? Math.min(100, Math.round((live.tickets_confirmed / live.tickets_target) * 100))
+          : (mappedStatus === 'completed' ? 100 : 0),
+      });
 
       if (mappedStatus === 'completed') {
         await sqlClient.query("UPDATE orders SET status='completed', updated_at=NOW(), completed_at=NOW() WHERE id=$1", [row.order_id]);
@@ -183,7 +267,8 @@ async function tick() {
 }
 
 async function main() {
-  process.stdout.write(JSON.stringify({ level: 'info', workerId, message: 'worker started with ChungSuc integration enabled' }) + '\n');
+  const mode = hasAvailableWorker() ? 'WS worker' : (chungSucClient.isConfigured() ? 'external API' : 'no provider');
+  process.stdout.write(JSON.stringify({ level: 'info', workerId, message: `worker started (dispatch mode: ${mode})` }) + '\n');
   while (true) {
     try {
       await tick();

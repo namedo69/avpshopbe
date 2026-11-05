@@ -14,7 +14,6 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "pg": "^8.13.1",
     "argon2": "^0.44.0",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
@@ -24,6 +23,8 @@
     "express-rate-limit": "^8.1.0",
     "helmet": "^8.1.0",
     "jose": "^6.1.0",
+    "pg": "^8.13.1",
+    "socket.io": "^4.8.4",
     "zod": "^4.1.12"
   },
   "devDependencies": {

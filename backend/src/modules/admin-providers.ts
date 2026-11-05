@@ -6,6 +6,7 @@ import { providers } from '../db/schema.js';
 import { sqlClient } from '../db/sql.js';
 import { AppError, parse, requireAdmin, requireUser } from '../lib/core.js';
 import { chungSucClient } from './chungsuc-adapter.js';
+import { getWorkersInfo } from './ws.js';
 
 export const adminProviderRouter = Router();
 
@@ -57,6 +58,7 @@ adminProviderRouter.get('/chungsuc', async (_req, res) => {
     },
     configured: chungSucClient.isConfigured(),
     partnerInfo,
+    workers: getWorkersInfo(),
     error: errorMsg,
   });
 });
