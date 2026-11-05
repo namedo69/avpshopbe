@@ -41,6 +41,7 @@ export const products = pgTable('products', {
 });
 export const providers = pgTable('providers', {
   id: id(), code: text('code').notNull().unique(), name: text('name').notNull(), baseUrl: text('base_url').notNull(), isActive: boolean('is_active').notNull().default(true),
+  dispatchMode: text('dispatch_mode').notNull().default('auto'),
 });
 export const providerProducts = pgTable('provider_products', {
   id: id(), productId: uuid('product_id').notNull().references(() => products.id), providerId: uuid('provider_id').notNull().references(() => providers.id),

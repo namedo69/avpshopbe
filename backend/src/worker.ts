@@ -9,16 +9,25 @@ const workerId = randomUUID();
 /**
  * Determine the dispatch mode for ChungSuc orders.
  *
- * Priority:
- *   1. If an AutoChungSuc desktop worker is connected via WebSocket -> dispatch locally
- *   2. Otherwise fall back to the external chungsuc.io.vn API (if configured)
- *
- * This allows seamless transition: when a worker goes offline, orders
- * automatically fall back to the external API, and vice versa.
+ * Configured modes:
+ *   - 'auto': Prefer PC worker via WebSocket, fallback to external 3rd-party API
+ *   - 'pc_only': Only dispatch to PC worker. If offline, keep job pending (no 3rd-party cost)
+ *   - 'api_only': Only dispatch to external 3rd-party API
  */
 type DispatchMode = 'ws_worker' | 'external_api' | 'none';
 
-function getDispatchMode(): DispatchMode {
+function getDispatchMode(configuredMode: string = 'auto'): DispatchMode {
+  if (configuredMode === 'pc_only') {
+    if (hasAvailableWorker()) return 'ws_worker';
+    return 'none';
+  }
+
+  if (configuredMode === 'api_only') {
+    if (chungSucClient.isConfigured()) return 'external_api';
+    return 'none';
+  }
+
+  // 'auto' mode: prefer PC worker, fallback to external API
   if (hasAvailableWorker()) return 'ws_worker';
   if (chungSucClient.isConfigured()) return 'external_api';
   return 'none';
@@ -78,10 +87,18 @@ async function processSendProviderOrder(jobId: string, orderId: string) {
   const quantity = Math.max(1, itemQty * requestsPerItem);
   const idempotencyKey = `cs_${order.order_code || order.id}`;
 
-  const mode = getDispatchMode();
+  const configuredMode = provider.dispatch_mode || 'auto';
+  const mode = getDispatchMode(configuredMode);
 
   if (mode === 'none') {
-    await sqlClient.query("UPDATE outbox_jobs SET status='failed', locked_at=NULL, last_error='No worker connected and ChungSuc API key missing' WHERE id=$1", [jobId]);
+    const reason = configuredMode === 'pc_only'
+      ? 'Đang chờ PC Worker kết nối (Chế độ Chỉ dùng PC)'
+      : 'Không có worker kết nối và API ChungSuc chưa cấu hình';
+    // Leave job as pending (with attempts not incremented) so it retries automatically next tick
+    await sqlClient.query(
+      "UPDATE outbox_jobs SET status='pending', locked_at=NULL, locked_by=NULL, last_error=$2 WHERE id=$1",
+      [jobId, reason]
+    );
     return;
   }
 

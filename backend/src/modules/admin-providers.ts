@@ -55,6 +55,7 @@ adminProviderRouter.get('/chungsuc', async (_req, res) => {
       code: provider.code,
       name: provider.name,
       isActive: provider.isActive,
+      dispatchMode: (provider as any).dispatchMode || 'auto',
     },
     configured: chungSucClient.isConfigured(),
     partnerInfo,
@@ -95,9 +96,45 @@ adminProviderRouter.patch('/chungsuc/toggle', async (req, res) => {
       code: updated!.code,
       name: updated!.name,
       isActive: updated!.isActive,
+      dispatchMode: (updated as any).dispatchMode || 'auto',
     },
     message: updated!.isActive
       ? 'Đã BẬT tự động đẩy đơn sang Chung Sức'
       : 'Đã TẮT tự động đẩy đơn sang Chung Sức (đơn sẽ chờ xử lý thủ công)',
+  });
+});
+
+/**
+ * Đổi chế độ điều phối: 'auto' | 'pc_only' | 'api_only'
+ * PATCH /api/v1/admin/providers/chungsuc/mode
+ */
+adminProviderRouter.patch('/chungsuc/mode', async (req, res) => {
+  const schema = z.object({
+    mode: z.enum(['auto', 'pc_only', 'api_only']),
+  });
+  const { mode } = parse(schema, req.body);
+  await ensureChungSucProvider();
+
+  const [updated] = await db.update(providers)
+    .set({ dispatchMode: mode })
+    .where(eq(providers.code, 'chungsuc'))
+    .returning();
+
+  const modeLabels: Record<string, string> = {
+    auto: 'Tự động (Ưu tiên PC, tự chuyển bên thứ 3 khi PC tắt)',
+    pc_only: 'Chỉ nhận về PC Worker (đơn chờ nếu PC tắt, không tốn Xu)',
+    api_only: 'Chỉ dùng API bên thứ 3 (chungsuc.io.vn)',
+  };
+
+  res.json({
+    success: true,
+    provider: {
+      id: updated!.id,
+      code: updated!.code,
+      name: updated!.name,
+      isActive: updated!.isActive,
+      dispatchMode: (updated as any).dispatchMode || mode,
+    },
+    message: `Đã chuyển chế độ sang: ${modeLabels[mode] || mode}`,
   });
 });
