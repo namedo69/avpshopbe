@@ -34,6 +34,9 @@ export interface JobDispatchPayload {
   code: string;               // event invitation code (cleaned)
   target: number;             // tickets target
   quantity: number;           // total ChungSuc quantity (items * requestsPerItem)
+  productType?: string;
+  credentialRefs?: Array<{ id?: string; externalAccountId: string; credentialRef: string; username?: string; password?: string }>;
+  accounts?: Array<{ id?: string; username: string; password: string }>;
 }
 
 export interface JobProgressPayload {
@@ -45,6 +48,16 @@ export interface JobProgressPayload {
   totalRequests: number;
   status: 'processing' | 'completed' | 'failed' | 'cancelled';
   message?: string;
+}
+
+export interface GroupJobResultPayload {
+  orderId: string;
+  orderCode: string;
+  itemId: string;
+  externalAccountId: string;
+  status: 'success' | 'failed';
+  result?: Record<string, unknown>;
+  error?: string;
 }
 
 export interface WorkerStatusPayload {
@@ -137,17 +150,23 @@ export function initSocketIO(httpServer: HttpServer): SocketIOServer {
       }
     });
 
-    socket.on('job:completed', (payload: { orderId: string; orderCode: string; ticketsConfirmed: number; ticketsTarget: number; completedRequests: number; totalRequests: number }) => {
+    socket.on('job:completed', async (payload: { orderId: string; orderCode: string; ticketsConfirmed: number; ticketsTarget: number; completedRequests: number; totalRequests: number }) => {
       const worker = connectedWorkers.get(workerId);
       if (worker) worker.activeJobs.delete(payload.orderId);
 
-      // Persist completion to DB
-      updateProviderOrderProgress({
-        ...payload,
-        status: 'completed',
-      }).catch(err => {
-        process.stderr.write(JSON.stringify({ level: 'error', message: 'DB update failed for job:completed', error: String(err) }) + '\n');
-      });
+      const groupCheck = await sqlClient.query("SELECT id FROM group_chest_jobs WHERE order_id=$1", [payload.orderId]);
+      if (groupCheck.rows[0]) {
+        await sqlClient.query("UPDATE group_chest_jobs SET status='completed', updated_at=NOW() WHERE order_id=$1", [payload.orderId]);
+        await sqlClient.query("UPDATE orders SET status='completed', updated_at=NOW(), completed_at=NOW() WHERE id=$1", [payload.orderId]);
+      } else {
+        // Persist completion to DB
+        updateProviderOrderProgress({
+          ...payload,
+          status: 'completed',
+        }).catch(err => {
+          process.stderr.write(JSON.stringify({ level: 'error', message: 'DB update failed for job:completed', error: String(err) }) + '\n');
+        });
+      }
 
       if (clientNs && payload.orderCode) {
         const progressData = {
@@ -164,23 +183,29 @@ export function initSocketIO(httpServer: HttpServer): SocketIOServer {
       }
     });
 
-    socket.on('job:failed', (payload: { orderId: string; orderCode: string; error: string; ticketsConfirmed?: number; ticketsTarget?: number }) => {
+    socket.on('job:failed', async (payload: { orderId: string; orderCode: string; error: string; ticketsConfirmed?: number; ticketsTarget?: number }) => {
       const worker = connectedWorkers.get(workerId);
       if (worker) worker.activeJobs.delete(payload.orderId);
 
-      // Persist failure to DB
-      updateProviderOrderProgress({
-        orderId: payload.orderId,
-        orderCode: payload.orderCode,
-        status: 'failed',
-        ticketsConfirmed: payload.ticketsConfirmed || 0,
-        ticketsTarget: payload.ticketsTarget || 0,
-        completedRequests: 0,
-        totalRequests: 0,
-        message: payload.error,
-      }).catch(err => {
-        process.stderr.write(JSON.stringify({ level: 'error', message: 'DB update failed for job:failed', error: String(err) }) + '\n');
-      });
+      const groupCheck = await sqlClient.query("SELECT id FROM group_chest_jobs WHERE order_id=$1", [payload.orderId]);
+      if (groupCheck.rows[0]) {
+        await sqlClient.query("UPDATE group_chest_jobs SET status='failed', updated_at=NOW() WHERE order_id=$1", [payload.orderId]);
+        await sqlClient.query("UPDATE orders SET status='failed', updated_at=NOW() WHERE id=$1", [payload.orderId]);
+      } else {
+        // Persist failure to DB
+        updateProviderOrderProgress({
+          orderId: payload.orderId,
+          orderCode: payload.orderCode,
+          status: 'failed',
+          ticketsConfirmed: payload.ticketsConfirmed || 0,
+          ticketsTarget: payload.ticketsTarget || 0,
+          completedRequests: 0,
+          totalRequests: 0,
+          message: payload.error,
+        }).catch(err => {
+          process.stderr.write(JSON.stringify({ level: 'error', message: 'DB update failed for job:failed', error: String(err) }) + '\n');
+        });
+      }
 
       if (clientNs && payload.orderCode) {
         const progressData = {
@@ -195,6 +220,57 @@ export function initSocketIO(httpServer: HttpServer): SocketIOServer {
         };
         clientNs.to(`order:${payload.orderCode}`).emit('order:progress', progressData);
         clientNs.to('orders:all').emit('order:progress', progressData);
+      }
+    });
+
+    socket.on('job:group-result', async (payload: GroupJobResultPayload) => {
+      try {
+        await sqlClient.query(`
+          UPDATE group_chest_job_items
+          SET status=$1, result=$2::jsonb, error_message=$3, updated_at=NOW()
+          WHERE (id=$4 OR external_account_id=$6) AND job_id=(SELECT id FROM group_chest_jobs WHERE order_id=$5)
+        `, [payload.status, JSON.stringify(payload.result || {}), payload.error || null, payload.itemId || null, payload.orderId, payload.externalAccountId || null]);
+        await sqlClient.query(`
+          UPDATE group_chest_jobs
+          SET completed_count=(SELECT count(*) FROM group_chest_job_items WHERE job_id=group_chest_jobs.id AND status='success'),
+              failed_count=(SELECT count(*) FROM group_chest_job_items WHERE job_id=group_chest_jobs.id AND status='failed'),
+              status=CASE WHEN (SELECT count(*) FROM group_chest_job_items WHERE job_id=group_chest_jobs.id AND status IN ('queued','processing'))=0
+                THEN CASE WHEN (SELECT count(*) FROM group_chest_job_items WHERE job_id=group_chest_jobs.id AND status='failed')>0 THEN 'failed' ELSE 'completed' END
+                ELSE 'processing' END,
+              updated_at=NOW()
+          WHERE order_id=$1
+        `, [payload.orderId]);
+        const state = await sqlClient.query<{ order_code: string; status: string; completed_count: number; item_count: number }>(`
+          SELECT o.order_code, gcj.status, gcj.completed_count, gcj.item_count
+          FROM orders o JOIN group_chest_jobs gcj ON gcj.order_id=o.id WHERE o.id=$1
+        `, [payload.orderId]);
+        const row = state.rows[0];
+        if (row) {
+          const done = row.status === 'completed' || row.status === 'failed';
+          await sqlClient.query("UPDATE orders SET status=$1, updated_at=NOW(), completed_at=CASE WHEN $1 IN ('completed','failed') THEN NOW() ELSE completed_at END WHERE id=$2", [row.status, payload.orderId]);
+          if (clientNs) {
+            clientNs.to(`order:${row.order_code}`).emit('order:progress', {
+              orderCode: row.order_code,
+              status: row.status,
+              ticketsTarget: row.item_count,
+              ticketsConfirmed: row.completed_count,
+              completedRequests: row.completed_count,
+              totalRequests: row.item_count,
+              progressPercent: row.item_count ? Math.round(row.completed_count * 100 / row.item_count) : 0,
+              message: done ? 'Mở rương nhóm đã kết thúc' : undefined,
+            });
+            clientNs.to(`order:${row.order_code}`).emit('group-chest:item-result', {
+              orderCode: row.order_code,
+              itemId: payload.itemId,
+              externalAccountId: payload.externalAccountId,
+              status: payload.status,
+              result: payload.result,
+              error: payload.error,
+            });
+          }
+        }
+      } catch (error) {
+        process.stderr.write(JSON.stringify({ level: 'error', message: 'group result update failed', error: String(error) }) + '\n');
       }
     });
 

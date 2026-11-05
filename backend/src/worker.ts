@@ -54,6 +54,13 @@ async function processSendProviderOrder(jobId: string, orderId: string) {
     return;
   }
 
+  // Group jobs use the registered PC agent path and do not depend on the
+  // legacy external ChungSuc provider.
+  if (order.customer_input?.productType === 'group_chest_open') {
+    await processGroupChestOrder(jobId, orderId);
+    return;
+  }
+
   // 2. Kiểm tra xem provider 'chungsuc' có đang BẬT không
   const provRes = await sqlClient.query("SELECT * FROM providers WHERE code='chungsuc' AND is_active=true LIMIT 1");
   const provider = provRes.rows[0];
@@ -184,6 +191,55 @@ async function processSendProviderOrder(jobId: string, orderId: string) {
       [jobId, errorMsg]
     );
   }
+}
+
+async function processGroupChestOrder(jobId: string, orderId: string) {
+  // The group job is dispatched through the existing WS worker channel after
+  // validating the order. Credentials are represented only by credentialRef.
+  const result = await sqlClient.query(`
+    SELECT o.order_code, gcj.id AS group_job_id, p.id AS provider_id,
+           json_agg(json_build_object(
+             'id', gci.id,
+             'externalAccountId', gci.external_account_id,
+             'credentialRef', gci.credential_ref,
+             'username', gci.external_account_id,
+             'password', gci.credential_ref
+           )) AS items
+    FROM orders o
+    JOIN group_chest_jobs gcj ON gcj.order_id=o.id
+    JOIN group_chest_job_items gci ON gci.job_id=gcj.id
+    JOIN products p ON p.id=gcj.product_id
+    WHERE o.id=$1
+    GROUP BY o.order_code, gcj.id, p.id
+  `, [orderId]);
+  const row = result.rows[0];
+  if (!row) {
+    await sqlClient.query("UPDATE outbox_jobs SET status='failed', locked_at=NULL, last_error='Group job not found' WHERE id=$1", [jobId]);
+    return;
+  }
+  const items = row.items || [];
+  const dispatched = dispatchJobToWorker({
+    jobId,
+    orderId,
+    orderCode: row.order_code,
+    code: '',
+    target: items.length,
+    quantity: items.length,
+    productType: 'group_chest_open',
+    credentialRefs: items,
+    accounts: items.map((it: any) => ({
+      id: it.id,
+      username: it.username || it.externalAccountId,
+      password: it.password || it.credentialRef,
+    })),
+  });
+  if (!dispatched) {
+    await sqlClient.query("UPDATE outbox_jobs SET status='pending', locked_at=NULL, locked_by=NULL, last_error='Đang chờ PC agent kết nối' WHERE id=$1", [jobId]);
+    return;
+  }
+  await sqlClient.query("UPDATE group_chest_jobs SET status='processing', updated_at=NOW() WHERE id=$1", [row.group_job_id]);
+  await sqlClient.query("UPDATE orders SET status='processing', updated_at=NOW() WHERE id=$1 AND status='queued'", [orderId]);
+  await sqlClient.query("UPDATE outbox_jobs SET status='completed', locked_at=NULL WHERE id=$1", [jobId]);
 }
 
 /**

@@ -124,3 +124,40 @@ export const auditLogs = pgTable('audit_logs', {
   id: id(), actorId: uuid('actor_id').references(() => users.id), action: text('action').notNull(), targetType: text('target_type').notNull(),
   targetId: text('target_id').notNull(), metadata: json('metadata'), createdAt: created(),
 });
+
+export const workerAgents = pgTable('worker_agents', {
+  id: id(),
+  agentCode: text('agent_code').notNull().unique(),
+  name: text('name').notNull(),
+  tokenHash: text('token_hash').notNull().unique(),
+  status: text('status').notNull().default('offline'),
+  lastSeenAt: timestamp('last_seen_at', { mode: 'date', withTimezone: true }),
+  capabilities: json('capabilities'),
+  createdAt: created(),
+  updatedAt: updated(),
+});
+
+export const groupChestJobs = pgTable('group_chest_jobs', {
+  id: id(),
+  orderId: uuid('order_id').notNull().references(() => orders.id),
+  productId: uuid('product_id').notNull().references(() => products.id),
+  itemCount: integer('item_count').notNull(),
+  completedCount: integer('completed_count').notNull().default(0),
+  failedCount: integer('failed_count').notNull().default(0),
+  status: text('status').notNull().default('queued'),
+  resultSummary: json('result_summary'),
+  createdAt: created(),
+  updatedAt: updated(),
+}, t => [uniqueIndex('group_chest_job_order_unique').on(t.orderId)]);
+
+export const groupChestJobItems = pgTable('group_chest_job_items', {
+  id: id(),
+  jobId: uuid('job_id').notNull().references(() => groupChestJobs.id),
+  externalAccountId: text('external_account_id').notNull(),
+  credentialRef: text('credential_ref').notNull(),
+  status: text('status').notNull().default('queued'),
+  result: json('result'),
+  errorMessage: text('error_message'),
+  createdAt: created(),
+  updatedAt: updated(),
+}, t => [index('group_chest_job_items_job_idx').on(t.jobId, t.createdAt)]);

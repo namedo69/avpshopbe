@@ -6,10 +6,33 @@ import { orders, orderItems, orderStatusLogs, providerOrders, vouchers, voucherP
 import { sqlClient } from '../db/sql.js';
 import { AppError, amountSchema, calcDiscount, code, parse, requireAdmin, requireUser, sha256 } from '../lib/core.js';
 import { chungSucClient, extractEventCode } from './chungsuc-adapter.js';
+import { parseGroupChestInput } from './group-chest.js';
 
 export const orderRouter = Router();
 export const adminOrderRouter = Router();
 export const walletRouter = Router();
+
+async function insertGroupChestJob(
+  client: { query: <T extends Record<string, any> = Record<string, any>>(source: string, values?: any[]) => Promise<{ rows: T[] }> },
+  orderId: string,
+  productId: string,
+  input: unknown,
+) {
+  const data = parseGroupChestInput(input);
+  if (!data) throw new AppError(400, 'INVALID_GROUP_CHEST_INPUT', 'Danh sách Mở rương nhóm không hợp lệ');
+  const inserted = await client.query<{ id: string }>(
+    'INSERT INTO group_chest_jobs(order_id,product_id,item_count,result_summary) VALUES($1,$2,$3,$4::jsonb) RETURNING id',
+    [orderId, productId, data.accounts.length, JSON.stringify({ mode: data.mode })],
+  );
+  const jobId = inserted.rows[0]?.id;
+  if (!jobId) throw new Error('Group chest job was not created');
+  for (const item of data.accounts) {
+    await client.query(
+      'INSERT INTO group_chest_job_items(job_id,external_account_id,credential_ref) VALUES($1,$2,$3)',
+      [jobId, item.externalAccountId, item.credentialRef],
+    );
+  }
+}
 
 const checkoutItemSchema = z.object({
   productId: z.uuid(),
@@ -82,10 +105,13 @@ orderRouter.post('/', async (req, res) => {
       if (!product) throw new AppError(400, 'INVALID_PRODUCT', 'Sản phẩm không khả dụng');
 
       const mapping = await client.query('SELECT 1 FROM provider_products pp JOIN providers p ON p.id=pp.provider_id WHERE pp.product_id=$1 AND pp.is_active=true AND p.is_active=true LIMIT 1', [item.productId]);
-      if (mapping.rows[0] || isChungSucActive) hasAnyProvider = true;
+      if (mapping.rows[0] || isChungSucActive || item.customerInput.productType === 'group_chest_open') hasAnyProvider = true;
 
       // Chuẩn hóa và làm sạch mã sự kiện trong customerInput
       const cleanedInput: Record<string, unknown> = { ...item.customerInput };
+      if (cleanedInput.productType === 'group_chest_open') {
+        if (!parseGroupChestInput(cleanedInput)) throw new AppError(400, 'INVALID_GROUP_CHEST_INPUT', 'Danh sách Mở rương nhóm không hợp lệ');
+      }
       const rawCode = cleanedInput.accountId || cleanedInput.code || cleanedInput.eventCode;
       if (rawCode) {
         const cleanCode = extractEventCode(rawCode);
@@ -264,6 +290,12 @@ orderRouter.post('/', async (req, res) => {
       );
     }
 
+    for (const line of lines) {
+      if (line.customerInput.productType === 'group_chest_open') {
+        await insertGroupChestJob(client, order.id, line.productId, line.customerInput);
+      }
+    }
+
     if (voucherId) {
       await client.query('INSERT INTO voucher_usages(voucher_id,user_id,order_id,discount_amount) VALUES($1,$2,$3,$4)', [voucherId, req.user!.id, order.id, totalDiscount]);
     }
@@ -362,6 +394,29 @@ orderRouter.get('/:orderCode/progress', async (req, res) => {
   let ticketsConfirmed = 0;
   let completedRequests = 0;
   let currentStatus = order.status;
+
+  const groupProgress = await sqlClient.query(`
+    SELECT status, item_count, completed_count, failed_count
+    FROM group_chest_jobs
+    WHERE order_id=$1
+    LIMIT 1
+  `, [order.id]);
+  const group = groupProgress.rows[0];
+  if (group) {
+    const target = Number(group.item_count) || 0;
+    const completed = Number(group.completed_count) || 0;
+    const status = String(group.status || order.status);
+    res.json({
+      orderCode: order.orderCode,
+      status,
+      ticketsTarget: target,
+      ticketsConfirmed: completed,
+      completedRequests: completed,
+      progressPercent: target > 0 ? Math.min(100, Math.round((completed / target) * 100)) : (status === 'completed' ? 100 : 0),
+      failedCount: Number(group.failed_count) || 0,
+    });
+    return;
+  }
 
   if (provOrder && provOrder.provider_code === 'chungsuc' && provOrder.external_order_id) {
     // Nếu đơn chưa xong và ChungSuc đã cấu hình, thử cập nhật nhanh
