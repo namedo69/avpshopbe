@@ -348,7 +348,7 @@ async function main() {
     } catch (error) {
       process.stderr.write(JSON.stringify({ level: 'error', workerId, message: String(error) }) + '\n');
     }
-    await new Promise(resolve => setTimeout(resolve, 8_000));
+    await new Promise(resolve => setTimeout(resolve, 2_500));
   }
 }
 

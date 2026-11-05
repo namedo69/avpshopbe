@@ -279,7 +279,26 @@ export function initSocketIO(httpServer: HttpServer): SocketIOServer {
       }
     });
 
-    socket.on('disconnect', (reason) => {
+    socket.on('disconnect', async (reason) => {
+      const worker = connectedWorkers.get(workerId);
+      if (worker && worker.activeJobs.size > 0) {
+        for (const orderId of worker.activeJobs) {
+          try {
+            await sqlClient.query(`
+              UPDATE outbox_jobs 
+              SET status = 'pending', locked_at = NULL, locked_by = NULL, last_error = 'PC worker ngắt kết nối - tự động xếp hàng lại'
+              WHERE aggregate_id = $1 AND status != 'completed'
+            `, [orderId]);
+            await sqlClient.query(`
+              UPDATE group_chest_jobs
+              SET status = 'queued', updated_at = NOW()
+              WHERE order_id = $1 AND status = 'processing'
+            `, [orderId]);
+          } catch (e) {
+            process.stderr.write(`Failed to requeue job for order ${orderId}: ${e}\n`);
+          }
+        }
+      }
       connectedWorkers.delete(workerId);
       process.stdout.write(JSON.stringify({ level: 'info', message: 'worker disconnected', workerId, reason, remaining: connectedWorkers.size }) + '\n');
     });
@@ -361,7 +380,7 @@ export function getWorkerCount(): number {
 export function dispatchJobToWorker(payload: JobDispatchPayload): boolean {
   if (connectedWorkers.size === 0) return false;
 
-  // Find worker with fewest active jobs
+  const maxActiveJobs = Number(process.env.WORKER_MAX_CONCURRENT_JOBS || 1);
   let bestWorker: { socket: Socket; activeJobs: Set<string> } | null = null;
   let bestCount = Infinity;
 
@@ -372,7 +391,8 @@ export function dispatchJobToWorker(payload: JobDispatchPayload): boolean {
     }
   }
 
-  if (!bestWorker) return false;
+  // Nếu tất cả các worker đều đang bận xử lý (mỗi worker >= maxActiveJobs), giữ đơn trong DB queue
+  if (!bestWorker || bestCount >= maxActiveJobs) return false;
 
   bestWorker.activeJobs.add(payload.orderId);
   bestWorker.socket.emit('job:dispatch', payload);
