@@ -56,7 +56,12 @@ async function processSendProviderOrder(jobId: string, orderId: string) {
 
   // Group jobs use the registered PC agent path and do not depend on the
   // legacy external ChungSuc provider.
-  if (order.customer_input?.productType === 'group_chest_open') {
+  let input = order.customer_input || {};
+  if (typeof input === 'string') {
+    try { input = JSON.parse(input); } catch {}
+  }
+  const isGroupJob = input?.productType === 'group_chest_open' || (await sqlClient.query('SELECT 1 FROM group_chest_jobs WHERE order_id = $1 LIMIT 1', [orderId])).rows.length > 0;
+  if (isGroupJob) {
     await processGroupChestOrder(jobId, orderId);
     return;
   }
@@ -71,7 +76,6 @@ async function processSendProviderOrder(jobId: string, orderId: string) {
   }
 
   // 3. Trích xuất mã code và số lượng
-  const input = order.customer_input || {};
   const rawCode = input.accountId || input.code || input.eventCode || '';
   const cleanCode = extractEventCode(rawCode);
 

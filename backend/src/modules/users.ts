@@ -83,17 +83,17 @@ adminUserRouter.get('/:id/orders', async (req, res) => {
   const result = await sqlClient.query(`
     SELECT o.*,
       COALESCE(
-        json_group_array(
-          json_object(
+        json_agg(
+          json_build_object(
             'id', oi.id,
             'productId', oi.product_id,
             'productName', oi.product_name,
             'unitPrice', oi.unit_price,
             'quantity', oi.quantity,
             'totalAmount', oi.total_amount,
-            'customerInput', json(oi.customer_input)
+            'customerInput', oi.customer_input
           )
-        ), '[]'
+        ) FILTER (WHERE oi.id IS NOT NULL), '[]'::json
       ) AS items
     FROM orders o
     LEFT JOIN order_items oi ON oi.order_id = o.id

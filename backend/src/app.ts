@@ -17,6 +17,7 @@ import { groupChestRouter } from './modules/group-chest.js';
 import { AppError, allowedOrigins } from './lib/core.js';
 
 export const app = express();
+app.set('trust proxy', 1);
 app.disable('x-powered-by');
 app.use(helmet());
 app.use(cors({
@@ -38,16 +39,22 @@ app.use((req, res, next) => {
 });
 app.get('/health/live', (_req, res) => res.json({ ok: true }));
 app.get('/health/ready', async (_req, res) => { await sqlClient.query('SELECT 1 FROM wallets LIMIT 1'); res.json({ ok: true }); });
-app.use('/api/v1/webhooks', express.raw({ type: 'application/json', limit: '32kb' }), rateLimit({ windowMs: 60_000, limit: 120 }), webhookRouter);
+app.use('/api/v1/webhooks', express.raw({ type: 'application/json', limit: '32kb' }), rateLimit({ windowMs: 60_000, limit: 600, standardHeaders: true, legacyHeaders: false }), webhookRouter);
 app.use(express.json({ limit: '64kb' }), cookieParser());
-const authLimit = rateLimit({ windowMs: 15 * 60_000, limit: 30 });
+const authLimit = rateLimit({
+  windowMs: 15 * 60_000,
+  limit: 1000,
+  skip: (req) => req.path === '/refresh' || req.path === '/me',
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 app.use('/api/v1/auth', authLimit, authRouter);
 app.use('/api/v1', meRouter);
 app.use('/api/v1/products', productRouter);
 app.use('/api/v1/wallet', walletRouter);
-app.use('/api/v1/deposits', rateLimit({ windowMs: 60_000, limit: 20 }), depositRouter);
+app.use('/api/v1/deposits', rateLimit({ windowMs: 60_000, limit: 300, standardHeaders: true, legacyHeaders: false }), depositRouter);
 app.use('/api/v1/vouchers', voucherRouter);
-app.use('/api/v1/orders', rateLimit({ windowMs: 60_000, limit: 30 }), orderRouter);
+app.use('/api/v1/orders', rateLimit({ windowMs: 60_000, limit: 300, standardHeaders: true, legacyHeaders: false }), orderRouter);
 app.use('/api/v1/admin/products', adminProductRouter);
 app.use('/api/v1/admin/vouchers', adminVoucherRouter);
 app.use('/api/v1/admin/orders', adminOrderRouter);
